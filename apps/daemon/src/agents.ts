@@ -232,17 +232,21 @@ function clampCodexReasoning(modelId, effort) {
 // Parse one-id-per-line stdout from `<cli> models` and prepend the synthetic
 // default option. Used by opencode / cursor-agent.
 function parseLineSeparatedModels(stdout) {
-  const ids = String(stdout || '')
+  const lines = String(stdout || '')
     .split('\n')
     .map((line) => line.trim())
-    .filter((line) => line.length > 0 && !line.startsWith('#'));
+    .filter((line) => line.length > 0 && !line.startsWith('#') && !/^Tip:/i.test(line) && !/^Available models/i.test(line));
   // De-dupe while preserving order — some CLIs print near-duplicates.
   const seen = new Set();
   const out = [DEFAULT_MODEL_OPTION];
-  for (const id of ids) {
+  for (const line of lines) {
+    // Some CLIs (cursor-agent) print `id - Description` — extract the id only.
+    const sep = line.indexOf(' - ');
+    const id = sep > 0 ? line.slice(0, sep).trim() : line;
     if (seen.has(id)) continue;
     seen.add(id);
-    out.push({ id, label: id });
+    const label = sep > 0 ? line.slice(sep + 3).trim() : id;
+    out.push({ id, label });
   }
   return out;
 }

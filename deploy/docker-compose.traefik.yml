@@ -1,0 +1,33 @@
+name: open-design-infra
+
+services:
+  traefik:
+    image: traefik:latest
+    container_name: open-design-traefik
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./deploy/traefik/traefik.yml:/traefik.yml:ro
+      - traefik_certs:/letsencrypt
+    environment:
+      - DOCKER_API_VERSION=1.44
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.traefik-dashboard.rule=Host(`traefik.jarvispro.design.online`)"
+      - "traefik.http.routers.traefik-dashboard.entrypoints=websecure"
+      - "traefik.http.routers.traefik-dashboard.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.traefik-dashboard.service=api@internal"
+    networks:
+      - open-design-net
+
+volumes:
+  traefik_certs:
+    driver: local
+
+networks:
+  open-design-net:
+    external: true
+    name: open-design-net
