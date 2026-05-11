@@ -45,12 +45,12 @@ services:
       - "traefik.http.routers.open-design.tls.certresolver=letsencrypt"
       - "traefik.http.services.open-design.loadbalancer.server.port=7456"
     networks:
-      - open-design-net
+      - ${TRAEFIK_NETWORK:-opencode-net}
 
 volumes:
   open_design_data:
 
 networks:
-  open-design-net:
+  opencode-net:
     external: true
-    name: open-design-net
+    name: opencode-net
