@@ -2,6 +2,7 @@
 import type { DesktopExportPdfInput, DesktopExportPdfResult } from '@open-design/sidecar-proto';
 import express from 'express';
 import multer from 'multer';
+import JSZip from 'jszip';
 import { execFile, spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { createRequire } from 'node:module';
@@ -10,6 +11,10 @@ import path from 'node:path';
 import fs from 'node:fs';
 import os from 'node:os';
 import net from 'node:net';
+import {
+  defaultScenarioPluginIdForKind,
+  PLUGIN_SHARE_ACTION_PLUGIN_IDS,
+} from '@open-design/contracts';
 import {
   composeSystemPrompt,
   renderCodexImagegenOverride,
@@ -26,28 +31,149 @@ import {
   detectAgents,
   getAgentDef,
   isKnownModel,
-  resolveAgentBin,
+  applyAgentLaunchEnv,
+  resolveAgentLaunch,
   sanitizeCustomModel,
   spawnEnvForAgent,
 } from './agents.js';
 import { migrateLegacyDataDirSync } from './legacy-data-migrator.js';
+import {
+  consumedImportNonces,
+  getDesktopAuthSecret,
+  isDesktopAuthGateActive,
+  isDesktopAuthRegistered,
+  pruneExpiredImportNonces,
+  resetDesktopAuthForTests,
+  setDesktopAuthSecret,
+  signDesktopImportToken,
+  verifyDesktopImportToken,
+} from './desktop-auth.js';
+export {
+  isDesktopAuthGateActive,
+  isDesktopAuthRegistered,
+  resetDesktopAuthForTests,
+  setDesktopAuthSecret,
+  signDesktopImportToken,
+  verifyDesktopImportToken,
+} from './desktop-auth.js';
 import { findSkillById, listSkills, splitDerivedSkillId } from './skills.js';
 import { validateLinkedDirs } from './linked-dirs.js';
 import { installFromTarget, uninstallById, sanitizeRepoName } from './library-install.js';
 import { buildWindowsFolderDialogCommand, parseFolderDialogStdout } from './native-folder-dialog.js';
 import { listCodexPets, readCodexPetSpritesheet } from './codex-pets.js';
 import { syncCommunityPets } from './community-pets-sync.js';
-import { listDesignSystems, readDesignSystem } from './design-systems.js';
+import {
+  createUserDesignSystem,
+  deleteUserDesignSystem,
+  LEGACY_DESIGN_SYSTEM_ARTIFACTS,
+  linkUserDesignSystemProject,
+  listDesignSystems,
+  listUserDesignSystemFiles,
+  listUserDesignSystemRevisions,
+  readDesignSystem,
+  readDesignSystemPackageInfo,
+  readUserDesignSystemFile,
+  resolveDesignSystemAssets,
+  updateUserDesignSystem,
+  updateUserDesignSystemRevisionStatus,
+} from './design-systems.js';
+import { createDesignSystemGenerationJobStore } from './design-system-generation-jobs.js';
+import {
+  applyDiffReviewDecisionToCwd,
+  applyPlugin,
+  defaultBundledRoot,
+  doctorPlugin,
+  FIRST_PARTY_ATOMS,
+  getInstalledPlugin,
+  getSnapshot,
+  installFromLocalFolder,
+  installPlugin,
+  isDiffReviewSurfaceId,
+  listInstalledPlugins,
+  listIterationsForRun,
+  MissingInputError,
+  pluginPromptBlock,
+  pruneExpiredSnapshots,
+  readPluginLockfile,
+  registerBuiltInAtomWorkers,
+  registerBundledPlugins,
+  registryRootsForDataDir,
+  resolvePluginSnapshot,
+  runPipelineForRun,
+  runStageWithRegistry,
+  startSnapshotGc,
+  uninstallPlugin,
+} from './plugins/index.js';
+import {
+  marketplaceManifestUrlForRegistry,
+  marketplaceRegistryIdFromUrl,
+} from './plugins/marketplaces.js';
+import {
+  getSurface,
+  listSurfacesForProject,
+  listSurfacesForRun,
+  prefillProjectSurface,
+  respondSurface as respondSurfaceRow,
+  revokeProjectSurface,
+} from './genui/index.js';
+import {
+  buildMemoryTree,
+  composeMemoryBody,
+  deleteMemoryEntry,
+  extractFromMessage,
+  listMemoryEntries,
+  maskMemoryExtractionConfig,
+  memoryDir,
+  memoryEvents,
+  readMemoryConfig,
+  readMemoryEntry,
+  readMemoryIndex,
+  updateMemoryTreeNode,
+  upsertMemoryEntry,
+  writeMemoryConfig,
+  writeMemoryIndex,
+} from './memory.js';
+import {
+  clearExtractions as clearMemoryExtractions,
+  listExtractions as listMemoryExtractions,
+  removeExtraction as removeMemoryExtraction,
+} from './memory-extractions.js';
 import { attachAcpSession } from './acp.js';
 import { attachPiRpcSession } from './pi-rpc.js';
+import {
+  applyAutomationProposal,
+  createAutomationProposal,
+  getAutomationProposal,
+  listAutomationProposals,
+  rejectAutomationProposal,
+} from './automation-proposals.js';
+import {
+  getAutomationSourcePacket,
+  ingestAutomationSource,
+  listAutomationSourcePackets,
+} from './automation-ingestions.js';
+import { ingestRoutineConnectorEvolution } from './automation-routine-evolution.js';
 import { createClaudeStreamHandler } from './claude-stream.js';
+import { diagnoseClaudeCliFailure } from './claude-diagnostics.js';
 import { loadCritiqueConfigFromEnv } from './critique/config.js';
 import { reconcileStaleRuns } from './critique/persistence.js';
 import { runOrchestrator } from './critique/orchestrator.js';
 import { createRunRegistry } from './critique/run-registry.js';
 import { handleCritiqueInterrupt } from './critique/interrupt-handler.js';
+import { handleCritiqueArtifact } from './critique/artifact-handler.js';
+import { getCritiqueMetrics, register } from './metrics/index.js';
+import { readConformanceHistory } from './critique/conformance-history.js';
+import { evaluateRollout } from './critique/ratchet.js';
+import {
+  isCritiqueEnabled,
+  parseEnvEnabled,
+  parseRolloutPhase,
+  type SkillCritiquePolicy,
+} from './critique/rollout.js';
+import { narrowProjectCritiqueOverride } from './critique/spawn-inputs.js';
 import { createCopilotStreamHandler } from './copilot-stream.js';
 import { createJsonEventStreamHandler } from './json-event-stream.js';
+import { classifyAgentAuthFailure, cursorAuthGuidance } from './runtimes/auth.js';
 import { createQoderStreamHandler } from './qoder-stream.js';
 import { subscribe as subscribeFileEvents } from './project-watchers.js';
 import { renderDesignSystemPreview } from './design-system-preview.js';
@@ -55,17 +181,25 @@ import { renderDesignSystemShowcase } from './design-system-showcase.js';
 import { createChatRunService } from './runs.js';
 import { reportRunCompletedFromDaemon } from './langfuse-bridge.js';
 import {
+  createAnalyticsService,
+  readAnalyticsContext,
+  readPublicConfigResponse,
+} from './analytics.js';
+import {
   redactSecrets,
   testAgentConnection,
   testProviderConnection,
   validateBaseUrl,
+  validateBaseUrlResolved,
 } from './connectionTest.js';
 import { listProviderModels } from './providerModels.js';
 import { importClaudeDesignZip } from './claude-design-import.js';
 import {
+  defaultBaseUrlForFinalizeProtocol,
   finalizeDesignPackage,
   FinalizePackageLockedError,
   FinalizeUpstreamError,
+  isFinalizeProviderProtocol,
 } from './finalize-design.js';
 import { listPromptTemplates, readPromptTemplate } from './prompt-templates.js';
 import { buildDocumentPreview } from './document-preview.js';
@@ -74,6 +208,7 @@ import { loadCraftSections } from './craft.js';
 import { stageActiveSkill } from './cwd-aliases.js';
 import { buildDesktopPdfExportInput } from './pdf-export.js';
 import { generateMedia } from './media.js';
+import { listElevenLabsVoiceOptions } from './elevenlabs-voices.js';
 import { searchResearch, ResearchError } from './research/index.js';
 import { renderResearchCommandContract } from './prompts/research-contract.js';
 import {
@@ -116,8 +251,9 @@ import {
   readAllTokens,
   setToken,
 } from './mcp-tokens.js';
-import { agentCliEnvForAgent, readAppConfig, writeAppConfig } from './app-config.js';
+import { agentCliEnvForAgent, readAppConfig, readPluginEnvKnobs, writeAppConfig } from './app-config.js';
 import { OrbitService, formatLocalProjectTimestamp, renderOrbitTemplateSystemPrompt } from './orbit.js';
+import { buildOrbitNoLiveArtifactSummary } from './orbit-agent-summary.js';
 import {
   RoutineService,
   validateSchedule as validateRoutineSchedule,
@@ -134,17 +270,22 @@ import {
   isSafeId,
   listFiles,
   mimeFor,
+  parseByteRange,
   projectDir,
   readProjectFile,
   renameProjectFile,
   removeProjectDir,
+  resolveProjectDir,
   sanitizeName,
   searchProjectFiles,
+  resolveProjectDir,
+  resolveProjectFilePath,
   writeProjectFile,
 } from './projects.js';
 import { validateArtifactManifestInput } from './artifact-manifest.js';
 import { readCurrentAppVersionInfo } from './app-version.js';
 import {
+  appendMessageStatusEvent,
   deleteConversation,
   deletePreviewComment,
   deleteProject as dbDeleteProject,
@@ -159,6 +300,8 @@ import {
   insertRoutine,
   insertRoutineRun,
   insertTemplate,
+  findTemplateByNameAndProject,
+  updateTemplate,
   listProjectsAwaitingInput,
   listConversations,
   listDeployments,
@@ -200,9 +343,22 @@ import {
 import { LiveArtifactRefreshUnavailableError, refreshLiveArtifact } from './live-artifacts/refresh-service.js';
 import { LiveArtifactRefreshAbortError } from './live-artifacts/refresh.js';
 import { registerConnectorRoutes } from './connectors/routes.js';
-import { configureConnectorCredentialStore, ConnectorServiceError, deleteConnectorCredentialsByProvider, FileConnectorCredentialStore } from './connectors/service.js';
+import { registerActiveContextRoutes } from './active-context-routes.js';
+import { registerMcpRoutes } from './mcp-routes.js';
+import { registerXaiRoutes } from './xai-routes.js';
+import { registerLiveArtifactRoutes } from './live-artifact-routes.js';
+import { registerDesignSystemToolRoutes } from './design-system-tool-routes.js';
+import { registerDeployRoutes, registerDeploymentCheckRoutes } from './deploy-routes.js';
+import { registerMediaRoutes } from './media-routes.js';
+import { registerProjectRoutes, registerProjectArtifactRoutes, registerProjectFileRoutes, registerProjectUploadRoutes } from './project-routes.js';
+import { registerFinalizeRoutes, registerImportRoutes, registerProjectExportRoutes } from './import-export-routes.js';
+import { registerChatRoutes } from './chat-routes.js';
+import { registerStaticResourceRoutes } from './static-resource-routes.js';
+import { registerRoutineRoutes, routineDbRowToContract } from './routine-routes.js';
+import { assertServerContextSatisfiesRoutes } from './route-context-contract.js';
+import { configureConnectorCredentialStore, ConnectorServiceError, FileConnectorCredentialStore } from './connectors/service.js';
 import { composioConnectorProvider } from './connectors/composio.js';
-import { configureComposioConfigStore, readComposioConfig, readPublicComposioConfig, writeComposioConfig } from './connectors/composio-config.js';
+import { configureComposioConfigStore } from './connectors/composio-config.js';
 import { CHAT_TOOL_ENDPOINTS, CHAT_TOOL_OPERATIONS, toolTokenRegistry } from './tool-tokens.js';
 import {
   aggregateCloudflarePagesStatus,
@@ -236,6 +392,7 @@ import {
 /** @typedef {import('@open-design/contracts').ChatSseEvent} ChatSseEvent */
 /** @typedef {import('@open-design/contracts').ProxyStreamRequest} ProxyStreamRequest */
 /** @typedef {import('@open-design/contracts').ProxySseEvent} ProxySseEvent */
+/** @typedef {import('@open-design/contracts').ProjectConversationCreatedSsePayload} ProjectConversationCreatedSsePayload */
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -287,6 +444,16 @@ export function composeLiveInstructionPrompt({
     parts.push(override);
   }
   return parts.join('\n\n---\n\n');
+}
+
+function renderPluginBriefTemplate(template, inputs = {}) {
+  if (typeof template !== 'string' || template.length === 0) return '';
+  return template.replace(/\{\{\s*([a-zA-Z_][\w-]*)\s*\}\}/g, (full, key) => {
+    if (!Object.hasOwn(inputs, key)) return full;
+    const value = inputs[key];
+    if (value === undefined || value === null || value === '') return full;
+    return String(value);
+  });
 }
 
 export function resolveResearchCommandContract(research, message) {
@@ -548,9 +715,15 @@ export function normalizeCommentAttachments(input) {
       const elementId = cleanString(raw.elementId);
       const selector = cleanString(raw.selector);
       const label = cleanString(raw.label);
-      const comment = cleanString(raw.comment);
-      if (!filePath || !elementId || !selector || !comment) return null;
-      const selectionKind = raw.selectionKind === 'pod' ? 'pod' : 'element';
+      const screenshotPath = cleanString(raw.screenshotPath);
+      const markKind = normalizeVisualMarkKind(raw.markKind);
+      const intent = compactString(raw.intent, 220);
+      const comment = cleanString(raw.comment) || intent;
+      const selectionKind =
+        raw.selectionKind === 'visual' ? 'visual' : raw.selectionKind === 'pod' ? 'pod' : 'element';
+      if (!filePath || !elementId || !comment) return null;
+      if (selectionKind !== 'visual' && !selector) return null;
+      if (selectionKind === 'visual' && !screenshotPath) return null;
       const podMembers = selectionKind === 'pod' ? normalizeAttachmentPodMembers(raw.podMembers) : [];
       const memberCount =
         selectionKind === 'pod'
@@ -576,6 +749,11 @@ export function normalizeCommentAttachments(input) {
         selectionKind,
         memberCount,
         podMembers,
+        screenshotPath: selectionKind === 'visual' ? screenshotPath : undefined,
+        markKind: selectionKind === 'visual' ? markKind : undefined,
+        intent: selectionKind === 'visual'
+          ? intent || visualAnnotationIntent(markKind)
+          : undefined,
         source: raw.source === 'board-batch' ? 'board-batch' : 'saved-comment',
       };
     })
@@ -589,22 +767,32 @@ export function renderCommentAttachmentHint(commentAttachments) {
     '',
     '',
     '<attached-preview-comments>',
-    'Scope: treat each attachment as the default refinement target. For single elements, edit the target element first. For pods, coordinate the captured group as one design region and preserve unrelated areas.',
+    'Scope: treat each attachment as the default refinement target. For visual marks, inspect the screenshot and modify the marked region first. Preserve unrelated areas.',
   ];
   for (const item of commentAttachments) {
-    const targetKind = item.selectionKind === 'pod' ? 'pod' : 'element';
+    const targetKind =
+      item.selectionKind === 'visual' ? 'visual' : item.selectionKind === 'pod' ? 'pod' : 'element';
     lines.push(
       '',
       `${item.order}. ${item.elementId}`,
       `targetKind: ${targetKind}`,
       `file: ${item.filePath}`,
-      `selector: ${item.selector}`,
       `label: ${item.label || '(unlabeled)'}`,
       `position: ${formatAttachmentPosition(item.pagePosition)}`,
       `currentText: ${item.currentText || '(empty)'}`,
       `htmlHint: ${item.htmlHint || '(none)'}`,
       `comment: ${item.comment}`,
     );
+    if (targetKind === 'visual') {
+      lines.push(
+        `screenshot: ${item.screenshotPath}`,
+        `markKind: ${item.markKind || 'stroke'}`,
+        `intent: ${item.intent || visualAnnotationIntent(item.markKind || 'stroke')}`,
+      );
+      if (item.selector) lines.push(`selector: ${item.selector}`);
+    } else {
+      lines.splice(lines.length - 4, 0, `selector: ${item.selector}`);
+    }
     if (targetKind === 'pod') {
       lines.push(`memberCount: ${item.memberCount || item.podMembers.length || 0}`);
       item.podMembers.slice(0, 8).forEach((member, memberIndex) => {
@@ -620,6 +808,22 @@ export function renderCommentAttachmentHint(commentAttachments) {
 
 function cleanString(value) {
   return typeof value === 'string' ? value.trim() : '';
+}
+
+function normalizeVisualMarkKind(value) {
+  return value === 'click' || value === 'click+stroke' || value === 'stroke'
+    ? value
+    : 'stroke';
+}
+
+function visualAnnotationIntent(markKind) {
+  if (markKind === 'click') {
+    return 'The screenshot has a blue focus box around the picked element; modify that picked part first.';
+  }
+  if (markKind === 'click+stroke') {
+    return 'The screenshot has a blue focus box and red strokes; together they identify the part the user wants changed.';
+  }
+  return 'The screenshot has red strokes that identify the visual region the user wants changed.';
 }
 
 function compactString(value, max) {
@@ -674,6 +878,32 @@ function isPathWithin(base, target) {
       !relativePath.startsWith('..') &&
       !path.isAbsolute(relativePath))
   );
+}
+
+export function resolveSafeProjectAttachments(cwd, attachments, opts = {}) {
+  if (!cwd || !Array.isArray(attachments)) return [];
+  const pathImpl = opts.pathImpl ?? path;
+  const existsSync = opts.existsSync ?? fs.existsSync;
+  const root = pathImpl.resolve(cwd);
+  const out = [];
+
+  for (const attachment of attachments) {
+    if (typeof attachment !== 'string' || attachment.length === 0) continue;
+    try {
+      const abs = pathImpl.resolve(root, attachment);
+      const relativePath = pathImpl.relative(root, abs);
+      const withinRoot =
+        relativePath === '' ||
+        (relativePath.length > 0 &&
+          !relativePath.startsWith('..') &&
+          !pathImpl.isAbsolute(relativePath));
+      if (withinRoot && existsSync(abs)) out.push(attachment);
+    } catch {
+      // Drop malformed paths; attachments are advisory prompt context.
+    }
+  }
+
+  return out;
 }
 
 function resolveProcessResourcesPath() {
@@ -751,6 +981,15 @@ const DESIGN_SYSTEMS_DIR = resolveDaemonResourceDir(
   'design-systems',
   path.join(PROJECT_ROOT, 'design-systems'),
 );
+// Renderable templates pulled out of `skills/` by the skills/design-templates
+// split (PR #955) so the EntryView Templates tab gets the large rendering
+// catalogue and Settings → Skills only carries functional skills the agent
+// invokes mid-task. See specs/current/skills-and-design-templates.md.
+const DESIGN_TEMPLATES_DIR = resolveDaemonResourceDir(
+  DAEMON_RESOURCE_ROOT,
+  'design-templates',
+  path.join(PROJECT_ROOT, 'design-templates'),
+);
 const CRAFT_DIR = resolveDaemonResourceDir(
   DAEMON_RESOURCE_ROOT,
   'craft',
@@ -778,6 +1017,117 @@ const PROMPT_TEMPLATES_DIR = resolveDaemonResourceDir(
   'prompt-templates',
   path.join(PROJECT_ROOT, 'prompt-templates'),
 );
+const BUNDLED_PLUGINS_DIR = resolveDaemonResourceDir(
+  DAEMON_RESOURCE_ROOT,
+  path.join('plugins', '_official'),
+  defaultBundledRoot(PROJECT_ROOT),
+);
+const PLUGIN_REGISTRY_DIR = resolveDaemonResourceDir(
+  DAEMON_RESOURCE_ROOT,
+  'plugins/registry',
+  path.join(PROJECT_ROOT, 'plugins', 'registry'),
+);
+const OFFICIAL_MARKETPLACE_ID = 'official';
+const OFFICIAL_PLUGIN_SOURCE_REPO = 'github:nexu-io/open-design@main';
+
+export function isStaticSpaFallbackRequest(req) {
+  if (req.method !== 'GET' && req.method !== 'HEAD') return false;
+  if (req.path === '/api' || req.path.startsWith('/api/')) return false;
+  if (req.path === '/artifacts' || req.path.startsWith('/artifacts/')) return false;
+  if (req.path === '/frames' || req.path.startsWith('/frames/')) return false;
+  if (req.path === '/_next' || req.path.startsWith('/_next/')) return false;
+
+  const accept = req.get?.('accept') ?? '';
+  return accept.length === 0 || accept.includes('text/html') || accept.includes('*/*');
+}
+
+export function resolveStaticSpaFallbackPath(req, staticDir) {
+  const indexPath = path.join(staticDir, 'index.html');
+  if (!fs.existsSync(indexPath) || !isStaticSpaFallbackRequest(req)) return null;
+  return indexPath;
+}
+
+export function registerStaticSpaFallback(app, staticDir) {
+  app.get('*', (req, res, next) => {
+    const indexPath = resolveStaticSpaFallbackPath(req, staticDir);
+    if (indexPath == null) return next();
+    res.sendFile(indexPath);
+  });
+}
+
+function defaultMarketplaceSeedConfig(id) {
+  return {
+    trust: id === OFFICIAL_MARKETPLACE_ID ? 'official' : 'restricted',
+    url:   marketplaceManifestUrlForRegistry(id),
+  };
+}
+
+function bundledPluginRegistrySource(sourcePath) {
+  if (isPathWithin(BUNDLED_PLUGINS_DIR, sourcePath)) {
+    const rel = path.relative(BUNDLED_PLUGINS_DIR, sourcePath).split(path.sep).join('/');
+    return `${OFFICIAL_PLUGIN_SOURCE_REPO}/plugins/_official/${rel}`;
+  }
+  const rel = path.relative(PROJECT_ROOT, sourcePath).split(path.sep).join('/');
+  if (!rel || rel.startsWith('..')) return sourcePath;
+  return `${OFFICIAL_PLUGIN_SOURCE_REPO}/${rel}`;
+}
+
+function mergeMarketplaceEntries(manifestText, entries) {
+  try {
+    const parsed = JSON.parse(manifestText);
+    const plugins = Array.isArray(parsed.plugins) ? parsed.plugins : [];
+    const seen = new Set(plugins.map((entry) => String(entry?.name ?? '').toLowerCase()));
+    const generated = entries.filter((entry) => {
+      const key = String(entry.name ?? '').toLowerCase();
+      if (!key || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+    return JSON.stringify({
+      ...parsed,
+      metadata: {
+        ...(parsed.metadata && typeof parsed.metadata === 'object' ? parsed.metadata : {}),
+        bundledPreinstallCount: entries.length,
+      },
+      plugins: [...plugins, ...generated],
+    });
+  } catch {
+    return manifestText;
+  }
+}
+
+async function marketplaceSeedManifestText(id, bundledMarketplaceEntries) {
+  const manifestPath = path.join(PLUGIN_REGISTRY_DIR, id, 'open-design-marketplace.json');
+  if (!fs.existsSync(manifestPath)) return null;
+  let manifestText = await fs.promises.readFile(manifestPath, 'utf8');
+  if (id === OFFICIAL_MARKETPLACE_ID && bundledMarketplaceEntries.length > 0) {
+    manifestText = mergeMarketplaceEntries(manifestText, bundledMarketplaceEntries);
+  }
+  return manifestText;
+}
+
+function createMarketplaceFetcher(seedId, bundledMarketplaceEntries) {
+  return async (url) => {
+    const registryId = marketplaceRegistryIdFromUrl(url);
+    if (registryId && (!seedId || registryId === seedId)) {
+      const manifestText = await marketplaceSeedManifestText(registryId, bundledMarketplaceEntries);
+      if (manifestText != null) {
+        return {
+          ok:     true,
+          status: 200,
+          text:   async () => manifestText,
+        };
+      }
+    }
+    const response = await fetch(url, { redirect: 'follow' });
+    return {
+      ok:     response.ok,
+      status: response.status,
+      text:   () => response.text(),
+    };
+  };
+}
+
 export function resolveDataDir(raw, projectRoot) {
   if (!raw) return path.join(projectRoot, '.od');
   // expandHomePrefix is shared with media-config.ts so OD_DATA_DIR and
@@ -815,6 +1165,7 @@ export function resolveDataDir(raw, projectRoot) {
   return resolved;
 }
 const RUNTIME_DATA_DIR = resolveDataDir(process.env.OD_DATA_DIR, PROJECT_ROOT);
+const PLUGIN_LOCKFILE_PATH = path.join(RUNTIME_DATA_DIR, 'od-plugin-lock.json');
 // Canonical (realpath-resolved) form of RUNTIME_DATA_DIR for the few callers
 // that compare it against a user-supplied realpath() result. On macOS, /var
 // is a symlink to /private/var, so an import realpath lands in /private/var
@@ -838,14 +1189,41 @@ migrateLegacyDataDirSync({
   dataDir: RUNTIME_DATA_DIR,
 });
 const ARTIFACTS_DIR = path.join(RUNTIME_DATA_DIR, 'artifacts');
+// Critique Theater artifacts intentionally live outside the static
+// `/artifacts` tree. The per-run artifact endpoint is the sanctioned
+// read path so project-membership, size, and CSP guards cannot be bypassed.
+const CRITIQUE_ARTIFACTS_DIR = path.join(RUNTIME_DATA_DIR, 'critique-artifacts');
 const PROJECTS_DIR = path.join(RUNTIME_DATA_DIR, 'projects');
 const USER_SKILLS_DIR = path.join(RUNTIME_DATA_DIR, 'skills');
 const USER_DESIGN_SYSTEMS_DIR = path.join(RUNTIME_DATA_DIR, 'design-systems');
+const PLUGIN_REGISTRY_ROOTS = registryRootsForDataDir(RUNTIME_DATA_DIR);
+// User-imported design templates mirror USER_SKILLS_DIR but are scanned
+// against DESIGN_TEMPLATES_DIR rather than SKILLS_DIR so the EntryView
+// Templates surface and the Settings → Skills surface stay decoupled.
+const USER_DESIGN_TEMPLATES_DIR = path.join(RUNTIME_DATA_DIR, 'design-templates');
+// Multi-root tuples used everywhere the daemon resolves a skill / template
+// id without knowing which surface it came from. SKILL_ROOTS drives
+// Settings → Skills; DESIGN_TEMPLATE_ROOTS drives the EntryView Templates
+// gallery; ALL_SKILL_LIKE_ROOTS spans both for chat run system-prompt
+// composition and the orbit template resolver, where stored project ids
+// can resolve to either root after the split.
+const SKILL_ROOTS = [USER_SKILLS_DIR, SKILLS_DIR];
+const DESIGN_TEMPLATE_ROOTS = [USER_DESIGN_TEMPLATES_DIR, DESIGN_TEMPLATES_DIR];
+const ALL_SKILL_LIKE_ROOTS = [
+  USER_SKILLS_DIR,
+  USER_DESIGN_TEMPLATES_DIR,
+  SKILLS_DIR,
+  DESIGN_TEMPLATES_DIR,
+];
 fs.mkdirSync(PROJECTS_DIR, { recursive: true });
-for (const dir of [USER_SKILLS_DIR, USER_DESIGN_SYSTEMS_DIR]) {
+for (const dir of [USER_SKILLS_DIR, USER_DESIGN_SYSTEMS_DIR, USER_DESIGN_TEMPLATES_DIR, PLUGIN_REGISTRY_ROOTS.userPluginsRoot]) {
   fs.mkdirSync(dir, { recursive: true });
 }
+fs.mkdirSync(CRITIQUE_ARTIFACTS_DIR, { recursive: true });
 const orbitService = new OrbitService(RUNTIME_DATA_DIR);
+const designSystemGenerationJobs = createDesignSystemGenerationJobStore({
+  root: USER_DESIGN_SYSTEMS_DIR,
+});
 let routineService = null;
 
 // In-memory OAuth state cache. Lives for the daemon process's lifetime.
@@ -945,7 +1323,7 @@ function emitLiveArtifactEvent(grant, action, artifact) {
     title: artifact.title ?? artifact.id,
     refreshStatus: artifact.refreshStatus,
   };
-  let emitted = emitProjectLiveArtifactEvent(payload.projectId, payload);
+  let emitted = emitProjectEvent(payload.projectId, payload);
   if (grant?.runId) emitted = emitChatAgentEvent(grant.runId, payload) || emitted;
   return emitted;
 }
@@ -957,12 +1335,16 @@ function emitLiveArtifactRefreshEvent(grant, payload) {
     projectId: grant.projectId,
     ...payload,
   };
-  let emitted = emitProjectLiveArtifactEvent(grant.projectId, event);
+  let emitted = emitProjectEvent(grant.projectId, event);
   if (grant?.runId) emitted = emitChatAgentEvent(grant.runId, event) || emitted;
   return emitted;
 }
 
-function emitProjectLiveArtifactEvent(projectId, payload) {
+// Broadcast an event to every SSE subscriber currently watching the given
+// project's `/api/projects/:id/events` stream. The payload's `type` field
+// becomes the SSE event name (see project-routes.ts). Used for live-artifact
+// events and `conversation-created` events emitted by routine runs (#1361).
+function emitProjectEvent(projectId, payload) {
   const sinks = activeProjectEventSinks.get(projectId);
   if (!sinks || sinks.size === 0) return false;
   for (const sink of Array.from(sinks)) {
@@ -1008,11 +1390,40 @@ export function createAgentRuntimeEnv(
   toolTokenGrant: { token?: string } | null = null,
   nodeBin: string = process.execPath,
 ): NodeJS.ProcessEnv {
-  const env = {
+  const env: NodeJS.ProcessEnv = {
     ...baseEnv,
+    OD_DATA_DIR: RUNTIME_DATA_DIR,
     OD_DAEMON_URL: daemonUrl,
     OD_NODE_BIN: nodeBin,
   };
+
+  // Ensure the node binary directory is on PATH so agent sub-processes —
+  // in particular npm .cmd shims on Windows that run `"node" script.js` —
+  // can find the same node binary that runs the daemon even when the daemon
+  // was launched with a full path to node and the directory was not on PATH.
+  const nodeBinDir = path.dirname(nodeBin);
+  if (nodeBinDir) {
+    // On Windows, process.env spreads with the search path under 'Path' rather
+    // than 'PATH'. Locate the key case-insensitively so we read and write the
+    // same entry that child_process.spawn consults. If we blindly write a new
+    // 'PATH' key alongside an existing 'Path', Node's case-insensitive env
+    // de-duplication on Windows lets the new key win — dropping all inherited
+    // directories (git, npm, agent shims, etc.) from the child's search path.
+    const pathKey = Object.keys(env).find((k) => k.toLowerCase() === 'path') ?? 'PATH';
+    const existingPath = typeof env[pathKey] === 'string' ? (env[pathKey] as string) : '';
+    const parts = existingPath.split(path.delimiter).filter((p) => p.length > 0);
+    const normalize = (p: string) => p.replace(/[/\\]+$/, '');
+    const normalizedDir = normalize(nodeBinDir);
+    const alreadyIncluded = parts.some((p) => {
+      const n = normalize(p);
+      return process.platform === 'win32'
+        ? n.toLowerCase() === normalizedDir.toLowerCase()
+        : n === normalizedDir;
+    });
+    if (!alreadyIncluded) {
+      env[pathKey] = [nodeBinDir, ...parts].join(path.delimiter);
+    }
+  }
 
   if (toolTokenGrant?.token) {
     env.OD_TOOL_TOKEN = toolTokenGrant.token;
@@ -1041,6 +1452,120 @@ export function createAgentRuntimeToolPrompt(
     tokenLine,
     '- Prefer project wrapper commands through `OD_NODE_BIN` + `OD_BIN` over raw HTTP. The wrappers read these environment values automatically.',
   ].join('\n');
+}
+
+function normalizeRunContextSelection(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+  const stringList = (items) => {
+    if (!Array.isArray(items)) return [];
+    const out = [];
+    const seen = new Set();
+    for (const item of items) {
+      if (typeof item !== 'string') continue;
+      const trimmed = item.trim();
+      if (!trimmed || seen.has(trimmed)) continue;
+      seen.add(trimmed);
+      out.push(trimmed);
+    }
+    return out;
+  };
+  return {
+    skillIds: stringList(value.skillIds),
+    pluginIds: stringList(value.pluginIds),
+    mcpServerIds: stringList(value.mcpServerIds),
+    connectorIds: stringList(value.connectorIds),
+  };
+}
+
+function mergeRunContextSelections(...contexts) {
+  const merged = { skillIds: [], pluginIds: [], mcpServerIds: [], connectorIds: [] };
+  for (const context of contexts) {
+    const normalized = normalizeRunContextSelection(context);
+    for (const key of Object.keys(merged)) {
+      const seen = new Set(merged[key]);
+      for (const id of normalized[key] ?? []) {
+        if (!seen.has(id)) {
+          seen.add(id);
+          merged[key].push(id);
+        }
+      }
+    }
+  }
+  return Object.fromEntries(
+    Object.entries(merged).filter(([, ids]) => ids.length > 0),
+  );
+}
+
+function projectMetadataContextSelection(metadata) {
+  if (!metadata || typeof metadata !== 'object') return {};
+  return {
+    pluginIds: Array.isArray(metadata.contextPlugins)
+      ? metadata.contextPlugins.map((item) => item?.id).filter((id) => typeof id === 'string')
+      : [],
+    mcpServerIds: Array.isArray(metadata.contextMcpServers)
+      ? metadata.contextMcpServers.map((item) => item?.id).filter((id) => typeof id === 'string')
+      : [],
+    connectorIds: Array.isArray(metadata.contextConnectors)
+      ? metadata.contextConnectors.map((item) => item?.id).filter((id) => typeof id === 'string')
+      : [],
+  };
+}
+
+function formatContextRefList(ids, refs, titleKey = 'title') {
+  const byId = new Map();
+  if (Array.isArray(refs)) {
+    for (const ref of refs) {
+      if (ref && typeof ref.id === 'string') byId.set(ref.id, ref);
+    }
+  }
+  return ids
+    .map((id) => {
+      const ref = byId.get(id);
+      const label =
+        typeof ref?.[titleKey] === 'string' && ref[titleKey].trim()
+          ? ref[titleKey].trim()
+          : typeof ref?.label === 'string' && ref.label.trim()
+            ? ref.label.trim()
+            : typeof ref?.name === 'string' && ref.name.trim()
+              ? ref.name.trim()
+              : id;
+      const meta = [
+        ref?.provider,
+        ref?.transport,
+        ref?.status,
+        ref?.accountLabel,
+      ].filter((value) => typeof value === 'string' && value.trim()).join(' · ');
+      return `- ${label} (\`${id}\`)${meta ? ` — ${meta}` : ''}`;
+    })
+    .join('\n');
+}
+
+function renderRunContextPrompt(selection, metadata) {
+  const context = mergeRunContextSelections(projectMetadataContextSelection(metadata), selection);
+  const lines = [];
+  if (Array.isArray(context.pluginIds) && context.pluginIds.length > 0) {
+    lines.push('### Selected plugins');
+    lines.push(
+      'The user selected these plugins as run context. When an active plugin snapshot is pinned, follow that executable plugin block; otherwise combine these plugins as requested references.',
+    );
+    lines.push(formatContextRefList(context.pluginIds, metadata?.contextPlugins ?? [], 'title'));
+  }
+  if (Array.isArray(context.mcpServerIds) && context.mcpServerIds.length > 0) {
+    lines.push('### Selected MCP servers');
+    lines.push(
+      'The user selected these MCP servers for this run. Prefer their tools when they are mounted and relevant before asking where data should come from.',
+    );
+    lines.push(formatContextRefList(context.mcpServerIds, metadata?.contextMcpServers ?? [], 'label'));
+  }
+  if (Array.isArray(context.connectorIds) && context.connectorIds.length > 0) {
+    lines.push('### Selected connectors');
+    lines.push(
+      'The user selected these connectors for this run. Discover available read-only connector tools first with `"$OD_NODE_BIN" "$OD_BIN" tools connectors list --format compact`, then execute relevant tools through `tools connectors execute`; do not ask for a data source that is already selected.',
+    );
+    lines.push(formatContextRefList(context.connectorIds, metadata?.contextConnectors ?? [], 'name'));
+  }
+  if (lines.length === 0) return '';
+  return ['## Selected run context', ...lines].join('\n');
 }
 
 export function normalizeProjectDisplayStatus(status) {
@@ -1097,7 +1622,232 @@ function sendApiError(res, status, code, message, init = {}) {
     .json(createCompatApiErrorResponse(code, message, init));
 }
 
+function normalizeProjectPluginFolderPath(input) {
+  const value = String(input ?? '').replace(/\\/g, '/').trim();
+  if (!value || value.includes('\0') || value.startsWith('/') || /^[A-Za-z]:\//.test(value)) {
+    throw new Error('plugin folder path must be a relative project path');
+  }
+  const parts = value.split('/').filter(Boolean);
+  if (parts.length === 0 || parts.some((part) => part === '.' || part === '..')) {
+    throw new Error('plugin folder path must not contain traversal segments');
+  }
+  return parts.join('/');
+}
+
+async function resolveProjectChildDirectory(projectRoot, relativePath) {
+  const rootReal = await fs.promises.realpath(projectRoot);
+  const candidate = path.resolve(projectRoot, relativePath);
+  const real = await fs.promises.realpath(candidate);
+  if (!real.startsWith(rootReal + path.sep) && real !== rootReal) {
+    throw new Error('plugin folder path escapes project dir');
+  }
+  const st = await fs.promises.stat(real);
+  if (!st.isDirectory()) {
+    const err = new Error('plugin folder path is not a directory');
+    err.code = 'ENOTDIR';
+    throw err;
+  }
+  return real;
+}
+
+function execFileBuffered(command, args, opts = {}) {
+  return new Promise((resolve) => {
+    execFile(command, args, { timeout: 120_000, maxBuffer: 1024 * 1024, ...opts }, (error, stdout, stderr) => {
+      resolve({
+        ok: !error,
+        code: error?.code,
+        stdout: String(stdout ?? '').trim(),
+        stderr: String(stderr ?? '').trim(),
+        error,
+      });
+    });
+  });
+}
+
+async function readProjectPluginManifest(folder) {
+  const raw = await fs.promises.readFile(path.join(folder, 'open-design.json'), 'utf8');
+  const manifest = JSON.parse(raw);
+  const name = typeof manifest.name === 'string' && manifest.name.trim()
+    ? manifest.name.trim()
+    : path.basename(folder);
+  return {
+    name,
+    title: typeof manifest.title === 'string' ? manifest.title : name,
+    version: typeof manifest.version === 'string' ? manifest.version : '0.1.0',
+    manifest,
+  };
+}
+
+function githubRepoNameFromPluginName(name) {
+  const slug = String(name)
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, '-')
+    .replace(/(^[-._]+|[-._]+$)/g, '');
+  return slug || 'open-design-plugin';
+}
+
+const PLUGIN_SHARE_ACTION_LABELS = {
+  'publish-github': 'Publish to GitHub',
+  'contribute-open-design': 'Contribute to Open Design',
+};
+
+const USER_PLUGIN_SOURCE_KINDS = new Set([
+  'user',
+  'project',
+  'marketplace',
+  'github',
+  'url',
+  'local',
+]);
+
+const PLUGIN_CONTEXT_SKIP_DIRS = new Set([
+  '.git',
+  '.next',
+  '.nuxt',
+  '.od',
+  '.output',
+  '.tmp',
+  '.turbo',
+  '.venv',
+  '__pycache__',
+  'build',
+  'coverage',
+  'dist',
+  'node_modules',
+  'out',
+  'target',
+  'vendor',
+]);
+
+const PLUGIN_CONTEXT_SKIP_FILES = new Set([
+  '.DS_Store',
+  'Thumbs.db',
+]);
+
+function normalizePluginShareAction(input) {
+  const value = typeof input === 'string' ? input.trim() : '';
+  return Object.prototype.hasOwnProperty.call(PLUGIN_SHARE_ACTION_PLUGIN_IDS, value)
+    ? value
+    : null;
+}
+
+function renderPluginSharePrompt({ action, sourcePlugin, stagedPath }) {
+  const title = sourcePlugin.title || sourcePlugin.id;
+  if (action === 'publish-github') {
+    return [
+      `Publish the local Open Design plugin "${title}" as a new public GitHub repository.`,
+      '',
+      `The plugin source files have been copied into this project at \`${stagedPath}\`.`,
+      'Use the local daemon share endpoint so the publish flow runs through Open Design\'s validated GitHub path:',
+      '',
+      '```bash',
+      `curl -sS -X POST "$OD_DAEMON_URL/api/projects/$OD_PROJECT_ID/plugins/publish-github" \\`,
+      `  -H 'content-type: application/json' \\`,
+      `  -d '${JSON.stringify({ path: stagedPath })}'`,
+      '```',
+      '',
+      'Read the JSON response. If `ok` is true, report the final repository URL and any validation/log summary. If it fails, report the `message`, `code`, and the useful log lines. The endpoint checks `gh` auth and performs the repository creation; do not hand-roll a second GitHub flow unless you are explaining a daemon endpoint failure.',
+      '',
+      'Do not rewrite the plugin unless publishing requires a small metadata fix. If you make any fix, explain it before publishing.',
+    ].join('\n');
+  }
+  return [
+    `Open a pull request to add the local Open Design plugin "${title}" to the Open Design repository.`,
+    '',
+    `The plugin source files have been copied into this project at \`${stagedPath}\`.`,
+    'Use the local daemon share endpoint so the contribution flow runs through Open Design\'s validated GitHub path:',
+    '',
+    '```bash',
+    `curl -sS -X POST "$OD_DAEMON_URL/api/projects/$OD_PROJECT_ID/plugins/contribute-open-design" \\`,
+    `  -H 'content-type: application/json' \\`,
+    `  -d '${JSON.stringify({ path: stagedPath })}'`,
+    '```',
+    '',
+    'Read the JSON response. If `ok` is true, report the PR URL, branch, and any validation/log summary. If it fails, report the `message`, `code`, and the useful log lines. The endpoint checks `gh` auth, forks/clones, pushes, and opens the PR; do not hand-roll a second GitHub flow unless you are explaining a daemon endpoint failure.',
+    '',
+    'Keep the PR focused on this plugin. Report the PR URL and any validation you ran.',
+  ].join('\n');
+}
+
+async function copyPluginFolderForProjectContext(sourceRoot, destRoot) {
+  const rootReal = await fs.promises.realpath(sourceRoot);
+  const stat = await fs.promises.stat(rootReal);
+  if (!stat.isDirectory()) {
+    const err = new Error('plugin source path is not a directory');
+    err.code = 'ENOTDIR';
+    throw err;
+  }
+  await copyPluginContextDir(rootReal, destRoot, rootReal);
+}
+
+async function copyPluginContextDir(src, dest, rootReal) {
+  await fs.promises.mkdir(dest, { recursive: true });
+  const entries = await fs.promises.readdir(src, { withFileTypes: true });
+  for (const entry of entries) {
+    if (shouldSkipPluginContextEntry(entry.name)) continue;
+    if (entry.isSymbolicLink()) continue;
+
+    const from = path.join(src, entry.name);
+    const to = path.join(dest, entry.name);
+    if (entry.isDirectory()) {
+      const childReal = await fs.promises.realpath(from).catch(() => null);
+      if (!childReal || (childReal !== rootReal && !childReal.startsWith(rootReal + path.sep))) {
+        continue;
+      }
+      await copyPluginContextDir(childReal, to, rootReal);
+      continue;
+    }
+    if (!entry.isFile()) continue;
+    await fs.promises.mkdir(path.dirname(to), { recursive: true });
+    await fs.promises.copyFile(from, to);
+  }
+}
+
+function shouldSkipPluginContextEntry(name) {
+  return PLUGIN_CONTEXT_SKIP_DIRS.has(name) || PLUGIN_CONTEXT_SKIP_FILES.has(name);
+}
+
+async function ensureGhReady() {
+  const version = await execFileBuffered('gh', ['--version'], { timeout: 10_000 });
+  if (!version.ok) {
+    return {
+      ok: false,
+      code: 'gh-not-installed',
+      message: 'GitHub CLI is not installed. Install it, then click this action again.',
+      url: 'https://cli.github.com/',
+      log: [version.stderr || version.stdout || 'gh --version failed'],
+    };
+  }
+  const auth = await execFileBuffered('gh', ['auth', 'status', '--hostname', 'github.com'], { timeout: 10_000 });
+  if (!auth.ok) {
+    return {
+      ok: false,
+      code: 'gh-not-authenticated',
+      message: 'GitHub CLI is installed but not authenticated. Run `gh auth login --web`, finish browser authorization, then click this action again.',
+      url: 'https://github.com/login/device',
+      log: [auth.stderr || auth.stdout || 'gh auth status failed'],
+    };
+  }
+  return { ok: true, log: [version.stdout, auth.stderr || auth.stdout].filter(Boolean) };
+}
+
 const TERMINAL_RUN_STATUSES = new Set(['succeeded', 'failed', 'canceled']);
+
+function reconcileAssistantMessageOnRunEnd(db, runs, run) {
+  if (!run.assistantMessageId) return;
+  void runs
+    .wait(run)
+    .then((finalStatus) => {
+      db.prepare(
+        `UPDATE messages
+            SET run_status = ?, ended_at = COALESCE(ended_at, ?)
+          WHERE id = ? AND run_status IN ('queued', 'running')`,
+      ).run(finalStatus.status, Date.now(), run.assistantMessageId);
+    })
+    .catch((err) => {
+      console.warn('[runs] message reconciliation failed', err);
+    });
+}
 
 export function shouldReportRunCompletedFromMessage(saved, body = {}) {
   return Boolean(
@@ -1111,6 +1861,37 @@ export function shouldReportRunCompletedFromMessage(saved, body = {}) {
 
 export function telemetryPromptFromRunRequest(message, currentPrompt) {
   return typeof currentPrompt === 'string' ? currentPrompt : message;
+}
+
+export function createFinalizedMessageTelemetryReporter({
+  design,
+  db,
+  dataDir,
+  reportedRuns,
+  getAppVersion = () => null,
+  report = reportRunCompletedFromDaemon,
+}: {
+  design: any;
+  db: unknown;
+  dataDir: string;
+  reportedRuns: Set<string>;
+  getAppVersion?: () => any;
+  report?: typeof reportRunCompletedFromDaemon;
+}) {
+  return (saved, body = {}) => {
+    if (!shouldReportRunCompletedFromMessage(saved, body)) return;
+    const run = design.runs.get(saved.runId);
+    if (!run || reportedRuns.has(run.id)) return;
+    reportedRuns.add(run.id);
+    void report({
+      db,
+      dataDir,
+      run,
+      persistedRunStatus: saved.runStatus,
+      persistedEndedAt: saved.endedAt,
+      appVersion: getAppVersion(),
+    });
+  };
 }
 
 const CLOUDFLARE_PAGES_PROJECT_METADATA_KEY = 'cloudflarePagesProjectName';
@@ -1599,6 +2380,16 @@ const importUpload = multer({
   limits: { fileSize: 100 * 1024 * 1024 },
 });
 
+const PLUGIN_UPLOAD_MAX_BYTES = 50 * 1024 * 1024;
+const pluginUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: PLUGIN_UPLOAD_MAX_BYTES,
+    files: 500,
+    fieldSize: 2 * 1024 * 1024,
+  },
+});
+
 // Project-scoped multi-file upload. Lands files directly in the project
 // folder (flat — same shape FileWorkspace expects), so the composer's
 // pasted/dropped/picked images become referenceable filenames the agent
@@ -1897,6 +2688,17 @@ function resolveChatRunShutdownGraceMs() {
   return Math.max(0, Math.floor(raw));
 }
 
+function resolveAcpStageTimeoutMs(): number | undefined {
+  // Per-stage silence watchdog for ACP chat sessions. Defaults are owned by
+  // `attachAcpSession` in acp.ts; this resolver only applies when an operator
+  // sets `OD_ACP_STAGE_TIMEOUT_MS`. Bounded to the same 24h ceiling as the
+  // outer chat inactivity watchdog so an oversized override doesn't get
+  // clamped to 1ms by Node's signed-32-bit delay limit.
+  const raw = Number(process.env.OD_ACP_STAGE_TIMEOUT_MS);
+  if (!Number.isFinite(raw)) return undefined;
+  return Math.min(MAX_CHAT_RUN_INACTIVITY_TIMEOUT_MS, Math.max(0, Math.floor(raw)));
+}
+
 export async function startServer({
   port = 7456,
   host = process.env.OD_BIND_HOST || '127.0.0.1',
@@ -1906,44 +2708,294 @@ export async function startServer({
   let resolvedPort = port;
   let daemonShuttingDown = false;
   const extraAllowedOrigins = configuredAllowedOrigins();
+
+  // Plan §3.K1 / spec §15.7 — bound-API-token guard.
+  //
+  // The daemon refuses to bind to a public interface unless an
+  // OD_API_TOKEN is set. This is the spec §16 Phase 5 safety floor:
+  // a hosted operator can no longer accidentally publish an unsecured
+  // daemon by setting OD_BIND_HOST=0.0.0.0 without a token.
+  //
+  // Loopback hosts (127.0.0.1 / ::1 / localhost) are always allowed —
+  // the desktop / dev flow remains unchanged. Setting OD_API_TOKEN is
+  // purely additive: when present, every /api/* request must carry a
+  // matching `Authorization: Bearer <token>` header (loopback origins
+  // are exempted so the desktop UI keeps working).
+  const apiToken = (process.env.OD_API_TOKEN ?? '').trim();
+  if (!isLoopbackHostname(host) && apiToken.length === 0) {
+    throw new Error(
+      `OD_BIND_HOST=${host} requires OD_API_TOKEN to be set. ` +
+      `Generate one with \`openssl rand -hex 32\` and re-launch. ` +
+      `(Loopback hosts 127.0.0.1 / ::1 / localhost do not need a token.)`,
+    );
+  }
+
   const app = express();
   app.use(express.json({ limit: '4mb' }));
 
-  // Multi-directory scanning: merge built-in and user-installed skills/DS.
-  // Built-in items win on ID collisions (higher priority per skills-protocol.md).
+  // Plan §3.K1 — bearer-token middleware.
+  //
+  // Active only when OD_API_TOKEN is set. Loopback origins skip the
+  // check (the desktop UI / local CLI never carry a bearer); every
+  // other request must present `Authorization: Bearer <token>` with a
+  // value matching `OD_API_TOKEN`. Health / version / status remain
+  // open so monitoring probes don't need the token.
+  if (apiToken.length > 0) {
+    const openProbePaths = new Set(['/api/health', '/api/version', '/api/daemon/status']);
+    app.use('/api', (req, res, next) => {
+      if (openProbePaths.has(req.path)) return next();
+      // Loopback short-circuit. We ignore the proxied X-Forwarded-For
+      // header here because a reverse proxy MUST always forward the
+      // bearer; the loopback bypass exists for the localhost desktop
+      // UI which has no proxy in the path.
+      if (isLoopbackPeerAddress(req.socket?.remoteAddress)) return next();
+      const auth = req.get('authorization') ?? '';
+      const match = /^Bearer\s+(\S+)\s*$/i.exec(auth);
+      if (!match || match[1] !== apiToken) {
+        return res.status(401).json({
+          error: { code: 'API_TOKEN_REQUIRED', message: 'Authorization: Bearer <OD_API_TOKEN> required' },
+        });
+      }
+      return next();
+    });
+  }
+
+  // Multi-directory scanning shared by every skill / template surface. The
+  // helpers delegate to listSkills(roots) which walks roots in priority
+  // order, tags each entry with the SkillSource ('user' for the user
+  // root, 'built-in' for the bundled root) the contracts package
+  // declares, and lets a user-imported entry shadow a built-in one of
+  // the same id without erasing the built-in copy.
   async function listAllSkills() {
-    const builtIn = (await listSkills(SKILLS_DIR)).map((s) => ({
-      ...s,
-      source: 'built-in',
-    }));
-    let installed = [];
-    try {
-      installed = (await listSkills(USER_SKILLS_DIR)).map((s) => ({
-        ...s,
-        source: 'installed',
-      }));
-    } catch {
-      // User directory may not exist yet or be unreadable.
-    }
-    const seen = new Set(builtIn.map((s) => s.id));
-    return [...builtIn, ...installed.filter((s) => !seen.has(s.id))];
+    return listSkills(SKILL_ROOTS);
+  }
+
+  async function listAllDesignTemplates() {
+    return listSkills(DESIGN_TEMPLATE_ROOTS);
+  }
+
+  // Spans both roots so chat run system-prompt composition and the orbit
+  // template resolver can resolve a stored project.skillId regardless of
+  // which surface created the project after the skills/design-templates
+  // split. Keep in sync with SKILL_ROOTS + DESIGN_TEMPLATE_ROOTS above.
+  async function listAllSkillLikeEntries() {
+    return listSkills(ALL_SKILL_LIKE_ROOTS);
   }
 
   async function listAllDesignSystems() {
     const builtIn = (await listDesignSystems(DESIGN_SYSTEMS_DIR)).map((s) => ({
       ...s,
       source: 'built-in',
+      isEditable: false,
+      status: 'published',
     }));
     let installed = [];
     try {
-      installed = (await listDesignSystems(USER_DESIGN_SYSTEMS_DIR)).map(
-        (s) => ({ ...s, source: 'installed' }),
-      );
+      installed = await listDesignSystems(USER_DESIGN_SYSTEMS_DIR, {
+        idPrefix: 'user:',
+        source: 'user',
+        isEditable: true,
+        defaultStatus: 'draft',
+      });
     } catch {
       // User directory may not exist yet or be unreadable.
     }
     const seen = new Set(builtIn.map((s) => s.id));
-    return [...builtIn, ...installed.filter((s) => !seen.has(s.id))];
+    return [
+      ...installed
+        .filter((s) => s.source === 'user')
+        .sort((a, b) => (b.updatedAt ?? '').localeCompare(a.updatedAt ?? '')),
+      ...builtIn,
+      ...installed.filter((s) => s.source !== 'user' && !seen.has(s.id)),
+    ];
+  }
+
+  async function readAvailableDesignSystem(id) {
+    if (typeof id === 'string' && id.startsWith('user:')) {
+      return readDesignSystem(USER_DESIGN_SYSTEMS_DIR, id, { idPrefix: 'user:' });
+    }
+    return (
+      (await readDesignSystem(DESIGN_SYSTEMS_DIR, id))
+      ?? (await readDesignSystem(USER_DESIGN_SYSTEMS_DIR, id))
+    );
+  }
+
+  async function readAvailableDesignSystemPackageInfo(id) {
+    if (typeof id === 'string' && id.startsWith('user:')) {
+      return readDesignSystemPackageInfo(USER_DESIGN_SYSTEMS_DIR, id, { idPrefix: 'user:' });
+    }
+    return (
+      (await readDesignSystemPackageInfo(DESIGN_SYSTEMS_DIR, id))
+      ?? (await readDesignSystemPackageInfo(USER_DESIGN_SYSTEMS_DIR, id))
+    );
+  }
+
+  function isProjectUsableDesignSystem(summary) {
+    return summary?.status !== 'draft';
+  }
+
+  async function validateProjectDesignSystemId(id) {
+    if (id === undefined || id === null || id === '') return { ok: true, id: null };
+    if (typeof id !== 'string') {
+      return {
+        ok: false,
+        code: 'INVALID_DESIGN_SYSTEM',
+        message: 'designSystemId must be a string or null',
+      };
+    }
+    const systems = await listAllDesignSystems();
+    const summary = systems.find((system) => system.id === id);
+    if (!summary) {
+      return {
+        ok: false,
+        code: 'DESIGN_SYSTEM_NOT_FOUND',
+        message: 'design system not found',
+      };
+    }
+    if (!isProjectUsableDesignSystem(summary)) {
+      return {
+        ok: false,
+        code: 'DESIGN_SYSTEM_NOT_PUBLISHED',
+        message: 'draft design systems cannot be used by projects',
+      };
+    }
+    return { ok: true, id };
+  }
+
+  function userDesignSystemWorkspaceProjectId(id) {
+    if (typeof id !== 'string' || !id.startsWith('user:')) return null;
+    const dirId = id.slice('user:'.length);
+    if (!/^[A-Za-z0-9._-]{1,120}$/.test(dirId)) return null;
+    return `ds-${dirId}`.slice(0, 128);
+  }
+
+  function projectBackedDesignSystemProjectId(id, summary) {
+    if (typeof summary?.projectId === 'string' && isSafeId(summary.projectId)) {
+      return summary.projectId;
+    }
+    return userDesignSystemWorkspaceProjectId(id);
+  }
+
+  async function ensureUserDesignSystemWorkspaceProject(db, id) {
+    const systems = await listAllDesignSystems();
+    const summary = systems.find((s) => s.id === id && s.source === 'user');
+    if (!summary) return null;
+    const projectId = projectBackedDesignSystemProjectId(id, summary);
+    if (!projectId) return null;
+
+    const now = Date.now();
+    const metadata = {
+      kind: 'other',
+      importedFrom: 'design-system',
+      entryFile: 'DESIGN.md',
+      sourceFileName: id,
+    };
+    const existing = getProject(db, projectId);
+    const project = existing
+      ? updateProject(db, projectId, {
+          name: summary.title,
+          designSystemId: id,
+          metadata: { ...existing.metadata, ...metadata },
+          updatedAt: now,
+        })
+      : insertProject(db, {
+          id: projectId,
+          name: summary.title,
+          skillId: null,
+          designSystemId: id,
+          pendingPrompt: null,
+          metadata,
+          createdAt: now,
+          updatedAt: now,
+        });
+    if (!project) return null;
+
+    const files = await listUserDesignSystemFiles(USER_DESIGN_SYSTEMS_DIR, id);
+    if (!files) return null;
+    for (const file of files) {
+      if (file.kind === 'folder') continue;
+      const detail = await readUserDesignSystemFile(USER_DESIGN_SYSTEMS_DIR, id, file.path);
+      if (!detail) continue;
+      if (existing) {
+        try {
+          const existingFile = await readProjectFile(PROJECTS_DIR, projectId, detail.path, project.metadata);
+          if (!isReplaceableDesignSystemWorkspaceFile(detail.path, existingFile)) continue;
+        } catch (err) {
+          if (!err || err.code !== 'ENOENT') throw err;
+        }
+      }
+      await writeProjectFile(
+        PROJECTS_DIR,
+        projectId,
+        detail.path,
+        Buffer.from(detail.content, 'utf8'),
+        {},
+        project.metadata,
+      );
+    }
+    await removeLegacyDesignSystemWorkspaceArtifacts(project);
+    await linkUserDesignSystemProject(USER_DESIGN_SYSTEMS_DIR, id, project.id);
+    const projectFiles = await listFiles(PROJECTS_DIR, projectId, { metadata: project.metadata });
+    return { project, files: projectFiles };
+  }
+
+  function isReplaceableDesignSystemWorkspaceFile(filePath, file) {
+    const buffer = file?.buffer;
+    if (!Buffer.isBuffer(buffer)) return false;
+    const text = buffer.toString('utf8');
+    if (/^ui_kits\/app\/components\/.+\.(jsx|tsx|js|ts|css|html)$/u.test(filePath)) {
+      return buffer.length < 700 && /od-ui-kit-[a-z-]+/u.test(text);
+    }
+    if (!/^(DESIGN\.md|README\.md|SKILL\.md|ui_kits\/app\/README\.md)$/u.test(filePath)) {
+      return false;
+    }
+    return hasLegacyDesignSystemPackageReferences(text);
+  }
+
+  function hasLegacyDesignSystemPackageReferences(text) {
+    return /preview\/(colors-node-types|colors-ui-palette|typography-scale|spacing-system|logo-variants)\.html|ui_kits\/generated_interface(?:\/index\.html|\/)?/u.test(text);
+  }
+
+  async function removeLegacyDesignSystemWorkspaceArtifacts(project) {
+    if (project?.metadata?.importedFrom !== 'design-system') return;
+    const dir = resolveProjectDir(PROJECTS_DIR, project.id, project.metadata);
+    for (const artifact of LEGACY_DESIGN_SYSTEM_ARTIFACTS) {
+      const replacementReady = await Promise.all(
+        artifact.replacementPaths.map(async (replacementPath) => {
+          try {
+            const stats = await fs.promises.stat(path.join(dir, ...replacementPath.split('/')));
+            return stats.isFile();
+          } catch (err) {
+            if (!err || (err.code !== 'ENOENT' && err.code !== 'ENOTDIR')) throw err;
+            return false;
+          }
+        }),
+      );
+      if (!replacementReady.every(Boolean)) continue;
+      await fs.promises.rm(path.join(dir, ...artifact.legacyPath.split('/')), {
+        recursive: artifact.removeDirectory === true,
+        force: true,
+      });
+    }
+  }
+
+  async function readDesignSystemWorkspaceTextFile(db, summary, filePath) {
+    if (!summary?.projectId || !isSafeId(summary.projectId)) return null;
+    const project = getProject(db, summary.projectId);
+    if (!project) return null;
+    try {
+      const file = await readProjectFile(
+        PROJECTS_DIR,
+        project.id,
+        filePath,
+        project.metadata,
+      );
+      const text = file.buffer.toString('utf8');
+      if (text.includes('\0')) return null;
+      return text;
+    } catch {
+      return null;
+    }
   }
 
   // Chrome may strip the port from the Origin header on same-origin GET
@@ -2024,6 +3076,7 @@ export async function startServer({
         completedAt: run.completedAt,
         summary: run.summary,
         error: run.error,
+        errorCode: run.errorCode,
       });
     },
     updateRun: (id, patch) => {
@@ -2060,6 +3113,92 @@ export async function startServer({
     console.log('[od] Codex plugins disabled via OD_CODEX_DISABLE_PLUGINS=1');
   }
 
+  let bundledMarketplaceEntries = [];
+  // Plan §3.I3 / spec §23.3.5 — register every plugin under
+  // <resourceRoot>/plugins/_official/** in packaged runs, or
+  // <projectRoot>/plugins/_official/** in workspace runs, as bundled plugins. The walker
+  // is idempotent (upserts on every boot) so a daemon upgrade rotates
+  // the bundled set in lockstep with the code. ENOENT is silent —
+  // running the daemon outside the dev tree just skips this step.
+  try {
+    const result = await registerBundledPlugins({
+      db,
+      bundledRoot: BUNDLED_PLUGINS_DIR,
+      marketplaceProvenance: {
+        sourceMarketplaceId: OFFICIAL_MARKETPLACE_ID,
+        marketplaceTrust:    'official',
+        entryNamePrefix:     'open-design',
+      },
+    });
+    bundledMarketplaceEntries = result.registered.map((plugin) => ({
+      name:        `open-design/${plugin.id}`,
+      title:       plugin.title,
+      description: plugin.description,
+      version:     plugin.version,
+      source:      bundledPluginRegistrySource(plugin.source),
+      publisher:   { id: 'open-design', url: 'https://open-design.ai' },
+      homepage:    plugin.manifest.homepage,
+      license:     plugin.manifest.license,
+      tags:        plugin.tags,
+      capabilitiesSummary: Array.isArray(plugin.manifest.od?.capabilities)
+        ? plugin.manifest.od.capabilities
+        : undefined,
+    }));
+    if (result.registered.length > 0) {
+      console.log(`[plugins] registered ${result.registered.length} bundled plugin(s)`);
+    }
+    if (result.warnings.length > 0) {
+      for (const w of result.warnings) console.warn(`[plugins] bundled warn: ${w}`);
+    }
+  } catch (err) {
+    console.warn(`[plugins] bundled registration failed: ${(err)?.message ?? err}`);
+  }
+
+  try {
+    const seedDirs = await fs.promises.readdir(PLUGIN_REGISTRY_DIR, { withFileTypes: true }).catch((err) => {
+      if (err?.code === 'ENOENT') return [];
+      throw err;
+    });
+    const { ensureMarketplaceManifest } = await import('./plugins/marketplaces.js');
+    for (const dirent of seedDirs) {
+      if (!dirent.isDirectory()) continue;
+      const id = dirent.name;
+      const manifestText = await marketplaceSeedManifestText(id, bundledMarketplaceEntries);
+      if (!manifestText) continue;
+      const configured = defaultMarketplaceSeedConfig(id);
+      const result = ensureMarketplaceManifest(db, {
+        id,
+        url: configured.url,
+        trust: configured.trust,
+        manifestText,
+      });
+      if (result.ok) {
+        console.log(`[plugins] seeded ${id} registry source (${result.row.manifest.plugins.length} plugin(s))`);
+      } else {
+        console.warn(`[plugins] ${id} registry seed failed: ${result.message}`);
+      }
+    }
+  } catch (err) {
+    console.warn(`[plugins] registry seed failed: ${(err)?.message ?? err}`);
+  }
+
+  // Plan §3.A5 / spec §16 Phase 5 / PB2: periodic snapshot GC. Disabled
+  // when OD_SNAPSHOT_GC_INTERVAL_MS is 0; otherwise one-time bootstrap
+  // sweep + interval. The function returns a NOOP_HANDLE when disabled
+  // so we don't have to branch on the result.
+  const snapshotGc = startSnapshotGc({ db });
+  // One immediate sweep so a daemon that just gained the ALTER doesn't
+  // wait the full interval before reaping pre-existing expired rows.
+  try {
+    const initialSweep = pruneExpiredSnapshots(db);
+    if (initialSweep.removed > 0) {
+      console.log(`[plugins] snapshot GC startup sweep removed ${initialSweep.removed} row(s)`);
+    }
+  } catch (err) {
+    console.warn(`[plugins] snapshot GC startup sweep failed: ${(err)?.message ?? err}`);
+  }
+  void snapshotGc; // keep handle alive for the daemon's lifetime
+
   // Warm agent-capability probes (e.g. whether the installed Claude Code
   // build advertises --include-partial-messages) so the first /api/chat
   // hits a populated cache even if /api/agents hasn't been called yet.
@@ -2069,8 +3208,6 @@ export async function startServer({
       return detectAgents(config.agentCliEnv ?? {});
     })
     .catch(() => detectAgents().catch(() => {}));
-
-  routineService.start();
 
   await recoverStaleLiveArtifactRefreshes({ projectsRoot: PROJECTS_DIR }).catch((error) => {
     console.warn('[od] Failed to recover stale live artifact refreshes:', error);
@@ -2090,728 +3227,1077 @@ export async function startServer({
     res.json({ version });
   });
 
-  registerConnectorRoutes(app, { sendApiError, authorizeToolRequest, projectsRoot: PROJECTS_DIR, requireLocalDaemonRequest });
+  // Plan §3.F2 / spec §11.7 — daemon lifecycle status. Returns the
+  // host / port the server is bound to plus the data dir,
+  // so `od daemon status --json` can render a one-shot health snapshot
+  // without depending on /api/version's content shape.
+  app.get('/api/daemon/status', async (_req, res) => {
+    const versionInfo = await readCurrentAppVersionInfo();
+    res.json({
+      ok: true,
+      version: versionInfo.version,
+      bindHost: process.env.OD_BIND_HOST ?? '127.0.0.1',
+      port: Number(process.env.OD_PORT ?? 7456),
+      dataDir: RUNTIME_DATA_DIR,
+      mediaConfigDir: process.env.OD_MEDIA_CONFIG_DIR ?? null,
+      pid: process.pid,
+      shuttingDown: daemonShuttingDown,
+      installedPlugins: (() => {
+        try {
+          return (db.prepare('SELECT COUNT(*) AS n FROM installed_plugins').get())?.n ?? 0;
+        } catch {
+          return 0;
+        }
+      })(),
+    });
+  });
 
-  app.get('/api/connectors/composio/config', (_req, res) => {
+  // Plan §3.GG1 — `od daemon db status`. Inventory of the SQLite
+  // backend: file path, size on disk (primary + WAL + SHM), schema
+  // version (the user_version PRAGMA we use for migrations), and
+  // per-table row counts. Useful for ops sanity-checking
+  // deployments + comparing 'expected' vs. 'actual' table rosters.
+  app.get('/api/daemon/db', async (_req, res) => {
     try {
-      res.json(readPublicComposioConfig());
+      const { inspectSqliteDatabase } = await import('./storage/db-inspect.js');
+      const file = path.join(RUNTIME_DATA_DIR, 'app.sqlite');
+      const report = await inspectSqliteDatabase({ db, file });
+      res.json(report);
     } catch (err) {
-      res.status(500).json({ error: String(err && err.message ? err.message : err) });
+      res.status(500).json({ error: String(err) });
     }
   });
 
-  app.put('/api/connectors/composio/config', requireLocalDaemonRequest, (req, res) => {
+  // Plan §3.KK1 — non-SSE one-shot read of the event ring buffer.
+  // Useful for dashboards + the `od plugin events snapshot` CLI
+  // command that doesn't need a live tail.
+  app.get('/api/plugins/events/snapshot', async (req, res) => {
+    const since = Number(typeof req.query.since === 'string' ? req.query.since : 0);
+    const { pluginEventSnapshot } = await import('./plugins/events.js');
+    const events = pluginEventSnapshot(Number.isFinite(since) && since > 0 ? since : 0);
+    res.json({ events, count: events.length, generatedAt: Date.now() });
+  });
+
+  // Plan §3.KK2 — rolled-up stats over the buffer. Counts by kind +
+  // pluginId + oldest/newest timestamps + id range.
+  app.get('/api/plugins/events/stats', async (_req, res) => {
+    const { pluginEventSnapshot, summarisePluginEvents } = await import('./plugins/events.js');
+    res.json({
+      stats: summarisePluginEvents(pluginEventSnapshot()),
+      generatedAt: Date.now(),
+    });
+  });
+
+  // Plan §3.NN1 — `od plugin events purge`. Operator escape
+  // hatch for resetting the in-memory ring buffer. Loopback-only
+  // because clearing the buffer drops audit history; an operator
+  // with shell access to the daemon machine should be the only
+  // one allowed to invoke. Returns the pre-purge stats so the
+  // caller can confirm what they discarded.
+  app.post('/api/plugins/events/purge', requireLocalDaemonRequest, async (_req, res) => {
     try {
-      const before = readComposioConfig();
-      const cfg = writeComposioConfig(req.body);
-      const after = readComposioConfig();
-      composioConnectorProvider.clearDiscoveryCache();
-      if (!cfg.configured || (before.apiKey && before.apiKey !== after.apiKey)) {
-        deleteConnectorCredentialsByProvider('composio');
-      }
-      res.json(cfg);
+      const { purgePluginEventBuffer } = await import('./plugins/events.js');
+      const result = purgePluginEventBuffer();
+      res.json({ ok: true, ...result });
     } catch (err) {
-      res.status(400).json({ error: String(err && err.message ? err.message : err) });
+      res.status(500).json({ error: String(err) });
     }
+  });
+
+  // Plan §3.II1 — `od plugin events tail`. SSE-backed live event
+  // stream of plugin lifecycle events from the in-memory ring
+  // buffer. On open: emits the buffered backlog as 'event: backlog'
+  // entries (capped at the buffer's MAX), then forwards every
+  // newly-recorded event as 'event: plugin' with the same shape.
+  // Optional ?since=<id> trims the backlog.
+  app.get('/api/plugins/events', async (req, res) => {
+    const since = Number(typeof req.query.since === 'string' ? req.query.since : 0);
+    const { pluginEventSnapshot, subscribePluginEvents } = await import('./plugins/events.js');
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders?.();
+
+    // Emit the backlog so a tail consumer doesn't miss installs
+    // that happened just before they connected.
+    const backlog = pluginEventSnapshot(Number.isFinite(since) && since > 0 ? since : 0);
+    for (const ev of backlog) {
+      res.write(`event: backlog\ndata: ${JSON.stringify(ev)}\n\n`);
+    }
+
+    const unsubscribe = subscribePluginEvents((ev) => {
+      res.write(`event: plugin\ndata: ${JSON.stringify(ev)}\n\n`);
+    });
+    req.on('close', () => { unsubscribe(); });
+  });
+
+  // Plan §3.LL1 — `od daemon db verify`. Runs SQLite
+  // PRAGMA integrity_check (or quick_check when ?quick=1) +
+  // PRAGMA foreign_key_check, returns a structured issues[]
+  // report. Loopback-only via requireLocalDaemonRequest because
+  // the result reveals storage-layer state.
+  app.post('/api/daemon/db/verify', requireLocalDaemonRequest, async (req, res) => {
+    try {
+      const { verifySqliteIntegrity } = await import('./storage/db-inspect.js');
+      const quick = String(req.query.quick ?? '').toLowerCase();
+      const report = verifySqliteIntegrity({ db, quick: quick === '1' || quick === 'true' });
+      res.json(report);
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  // Plan §3.HH2 — `od daemon db vacuum`. Runs SQLite VACUUM to
+  // reclaim space after large delete batches (snapshot prune,
+  // plugin uninstall, etc.). Reports before / after sizes so the
+  // operator sees the reclamation, plus elapsed ms so a slow
+  // VACUUM on a big DB is visible.
+  app.post('/api/daemon/db/vacuum', requireLocalDaemonRequest, async (_req, res) => {
+    try {
+      const { inspectSqliteDatabase } = await import('./storage/db-inspect.js');
+      const file = path.join(RUNTIME_DATA_DIR, 'app.sqlite');
+      const before = await inspectSqliteDatabase({ db, file });
+      const startedAt = Date.now();
+      // VACUUM cannot run inside an active transaction; better-sqlite3
+      // exposes it as a regular pragma exec.
+      db.exec('VACUUM');
+      const elapsedMs = Date.now() - startedAt;
+      const after = await inspectSqliteDatabase({ db, file });
+      res.json({
+        ok: true,
+        beforeBytes: before.sizeBytes,
+        afterBytes:  after.sizeBytes,
+        reclaimedBytes: Math.max(0, before.sizeBytes - after.sizeBytes),
+        elapsedMs,
+      });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  // Plan §3.F2 — graceful shutdown. The CLI calls this from
+  // `od daemon stop`; the actual close path goes through the same
+  // SIGTERM-equivalent flow as a parent-process kill (the boot wrapper
+  // in cli.ts wires the process listeners). 202 Accepted because the
+  // shutdown completes after the response flush.
+  app.post('/api/daemon/shutdown', requireLocalDaemonRequest, (_req, res) => {
+    res.status(202).json({ ok: true, scheduled: true });
+    setImmediate(() => {
+      try {
+        process.emit('SIGTERM');
+      } catch {
+        // Best-effort; if the listener was removed (or the process is
+        // mid-shutdown already) the kernel SIGTERM falls back below.
+      }
+    });
+  });
+
+  // Prometheus scrape endpoint (Phase 12). Returns the full exposition
+  // format string. Operators put this behind their existing auth proxy;
+  // there is no built-in authn on the daemon HTTP server. To disable
+  // the endpoint entirely (air-gapped installs, regulatory contexts),
+  // set `OD_METRICS_ENDPOINT=disabled`; the route is registered only
+  // when that env value is not the literal string 'disabled'.
+  if (process.env.OD_METRICS_ENDPOINT !== 'disabled') {
+    app.get('/api/metrics', async (_req, res) => {
+      res.setHeader('Content-Type', register.contentType);
+      res.send(await getCritiqueMetrics());
+    });
+  }
+
+  // Phase 16 ratchet endpoint. Returns the rolling conformance window
+  // and the ratchet's current recommendation. Operator-driven by
+  // design: the recommendation does not flip OD_CRITIQUE_ROLLOUT_PHASE
+  // automatically, it surfaces so a deploy-pipeline follow-up can
+  // consume it. Tunables come from query string; defaults are the
+  // spec values (14 days, 0.90 shipped, 0.95 clean-parse).
+  // Codex + lefarcen P1 on PR #1499: clamp query inputs before the
+  // evaluator sees them so a request like `?windowDays=0` falls back to
+  // the spec default rather than producing a zero-evidence promotion.
+  // The evaluator also defends at its own entry; both are intentional
+  // (belt + suspenders) so a future caller that bypasses this route
+  // cannot reach an unguarded code path either.
+  const parsePositiveInt = (raw: unknown, fallback: number): number => {
+    if (typeof raw !== 'string' || raw.length === 0) return fallback;
+    const n = Number(raw);
+    return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
+  };
+  const parseRate = (raw: unknown, fallback: number): number => {
+    if (typeof raw !== 'string' || raw.length === 0) return fallback;
+    const n = Number(raw);
+    return Number.isFinite(n) && n >= 0 && n <= 1 ? n : fallback;
+  };
+  app.get('/api/critique/conformance', async (req, res) => {
+    try {
+      const windowDays = parsePositiveInt(req.query.windowDays, 14);
+      const shippedThreshold = parseRate(req.query.shippedThreshold, 0.90);
+      const cleanParseThreshold = parseRate(req.query.cleanParseThreshold, 0.95);
+      const history = await readConformanceHistory(RUNTIME_DATA_DIR, windowDays);
+      const decision = evaluateRollout({
+        current: parseRolloutPhase(process.env.OD_CRITIQUE_ROLLOUT_PHASE),
+        history,
+        windowDays,
+        shippedThreshold,
+        cleanParseThreshold,
+      });
+      res.json({ window: { days: windowDays, history }, decision });
+    } catch (err) {
+      sendApiError(res, 500, 'INTERNAL_ERROR', err instanceof Error ? err.message : String(err));
+    }
+  });
+
+  registerConnectorRoutes(app, {
+    sendApiError,
+    authorizeToolRequest,
+    projectsRoot: PROJECTS_DIR,
+    requireLocalDaemonRequest,
+    composio: composioConnectorProvider,
   });
 
   // ---- Projects (DB-backed) -------------------------------------------------
 
-  // Soft "what is the user looking at right now in Open Design?" channel. The
-  // web UI POSTs the current project + file on every route change;
-  // the MCP surface reads it so a coding agent in another repo can
-  // resolve "the design I have open" without the user typing the
-  // project id. In-memory only - daemon restart clears it.
-  /** @type {{ projectId: string; fileName: string | null; ts: number } | null} */
-  let activeContext = null;
-  const ACTIVE_CONTEXT_TTL_MS = 5 * 60 * 1000;
 
-  // Active context is private to the local machine. The daemon binds
-  // 0.0.0.0 by default, so without an origin check a peer on the LAN
-  // could read what the user is currently looking at (GET) or spoof
-  // it to redirect MCP fallbacks (POST). The web proxies same-origin
-  // and the MCP runs in-process via 127.0.0.1, so both legitimate
-  // callers pass the check.
-  app.post('/api/active', (req, res) => {
-    if (!isLocalSameOrigin(req, resolvedPort)) {
-      return res.status(403).json({ error: 'cross-origin request rejected' });
-    }
+  // ----- Memory store -----------------------------------------------------
+  // Markdown-on-disk memory under <dataDir>/memory/. The daemon folds these
+  // into every system prompt (gated by `enabled`) and the chat run loop
+  // calls `/api/memory/extract` after each turn to sediment new facts.
+  app.get('/api/memory', async (_req, res) => {
     try {
-      const body = req.body || {};
-      if (body.active === false) {
-        activeContext = null;
-        res.json({ active: false });
-        return;
-      }
-      const projectId = typeof body.projectId === 'string' ? body.projectId : '';
-      if (!projectId) {
-        sendApiError(res, 400, 'BAD_REQUEST', 'projectId is required');
-        return;
-      }
-      const fileName =
-        typeof body.fileName === 'string' && body.fileName.length > 0
-          ? body.fileName
-          : null;
-      activeContext = { projectId, fileName, ts: Date.now() };
-      res.json({ active: true, ...activeContext });
+      const [config, index, entries] = await Promise.all([
+        readMemoryConfig(RUNTIME_DATA_DIR),
+        readMemoryIndex(RUNTIME_DATA_DIR),
+        listMemoryEntries(RUNTIME_DATA_DIR),
+      ]);
+      res.json({
+        enabled: config.enabled,
+        rootDir: memoryDir(RUNTIME_DATA_DIR),
+        index,
+        entries,
+        extraction: maskMemoryExtractionConfig(config.extraction),
+      });
     } catch (err) {
-      sendApiError(res, 400, 'BAD_REQUEST', String(err));
+      res.status(500).json({ error: String(err) });
     }
   });
 
-  app.get('/api/active', (req, res) => {
-    if (!isLocalSameOrigin(req, resolvedPort)) {
-      return res.status(403).json({ error: 'cross-origin request rejected' });
-    }
-    if (!activeContext || Date.now() - activeContext.ts > ACTIVE_CONTEXT_TTL_MS) {
-      activeContext = null;
-      res.json({ active: false });
-      return;
-    }
-    const project = getProject(db, activeContext.projectId);
-    res.json({
-      active: true,
-      projectId: activeContext.projectId,
-      projectName: project?.name ?? null,
-      fileName: activeContext.fileName,
-      ts: activeContext.ts,
-      ageMs: Date.now() - activeContext.ts,
-    });
-  });
-
-  // Surfaces the absolute paths to the daemon's Node-compatible runtime and
-  // CLI entry so the Settings → MCP server panel can render snippets that work
-  // even when `od` isn't on the user's PATH (the common case for source clones
-  // - and macOS/Linux ship a /usr/bin/od octal-dump tool that shadows ours
-  // anyway). Cached for 5s because the panel pings on every open and these
-  // paths cannot change without a daemon restart.
-  const INSTALL_INFO_TTL_MS = 5000;
-  let installInfoCache: { t: number; payload: object } | null = null;
-
-  app.get('/api/mcp/install-info', (req, res) => {
-    if (!isLocalSameOrigin(req, resolvedPort)) {
-      return res.status(403).json({ error: 'cross-origin request rejected' });
-    }
-    const now = Date.now();
-    if (installInfoCache && now - installInfoCache.t < INSTALL_INFO_TTL_MS) {
-      return res.json(installInfoCache.payload);
-    }
-    // process.execPath is the absolute path to the Node-compatible
-    // runtime that is running the daemon RIGHT NOW. In packaged builds
-    // this may be Electron running with ELECTRON_RUN_AS_NODE=1 rather
-    // than a separate bundled Node binary; the helper surfaces that env
-    // requirement with the command so IDE-spawned MCP clients can
-    // reproduce the same mode from a minimal OS launcher environment.
-    const cliPath = OD_BIN;
-    // The daemon was bootstrapped as a sidecar (tools-dev, packaged) iff
-    // bootstrapSidecarRuntime stamped OD_SIDECAR_IPC_PATH into the env.
-    // In sidecar mode the snippet omits --daemon-url and the spawned
-    // `od mcp` discovers the live URL via the IPC status socket on
-    // every spawn, so the client config survives ephemeral-port
-    // restarts. We also propagate OD_SIDECAR_NAMESPACE (and IPC_BASE
-    // when overridden) so a non-default namespace daemon stays
-    // reachable - the MCP client does not inherit the daemon's env,
-    // so without this the spawned `od mcp` would probe the default
-    // namespace socket and miss. For direct `od` / `od --port X`
-    // launches there is no IPC socket; the helper bakes --daemon-url
-    // so custom ports keep working.
-    const sidecarIpcPath = process.env[SIDECAR_ENV.IPC_PATH];
-    const isSidecarMode = sidecarIpcPath != null && sidecarIpcPath.length > 0;
-    const sidecarEnv: Record<string, string> = {};
-    if (isSidecarMode) {
-      const ns = process.env[SIDECAR_ENV.NAMESPACE];
-      if (ns != null && ns !== SIDECAR_DEFAULTS.namespace) {
-        sidecarEnv[SIDECAR_ENV.NAMESPACE] = ns;
-      }
-      const ipcBase = process.env[SIDECAR_ENV.IPC_BASE];
-      if (ipcBase != null && ipcBase.length > 0) {
-        sidecarEnv[SIDECAR_ENV.IPC_BASE] = ipcBase;
-      }
-    }
-    const payload = buildMcpInstallPayload({
-      cliPath,
-      cliExists: fs.existsSync(cliPath),
-      execPath: process.execPath,
-      nodeExists: fs.existsSync(process.execPath),
-      port: resolvedPort,
-      platform: process.platform,
-      dataDir: RUNTIME_DATA_DIR,
-      electronAsNode: process.env.ELECTRON_RUN_AS_NODE === '1',
-      isSidecarMode,
-      sidecarEnv,
-    });
-    installInfoCache = { t: now, payload };
-    res.json(payload);
-  });
-
-  // External MCP server configuration. Open Design connects to these as a
-  // CLIENT and surfaces their tools to the underlying agent at spawn time.
-  // GET returns user-saved entries plus the built-in template list so the UI
-  // can render the "Add MCP server" picker without a second round-trip.
-  app.get('/api/mcp/servers', async (req, res) => {
-    if (!isLocalSameOrigin(req, resolvedPort)) {
-      return res.status(403).json({ error: 'cross-origin request rejected' });
-    }
+  // Static sub-resources (`/index`, `/config`, `/extract`) registered
+  // BEFORE the `:id` catch-alls so an `index` / `config` / `extract` slug
+  // can't shadow the real handlers.
+  app.get('/api/memory/tree', async (_req, res) => {
     try {
-      const cfg = await readMcpConfig(RUNTIME_DATA_DIR);
-      res.json({ servers: cfg.servers, templates: MCP_TEMPLATES });
+      const [config, tree] = await Promise.all([
+        readMemoryConfig(RUNTIME_DATA_DIR),
+        buildMemoryTree(RUNTIME_DATA_DIR),
+      ]);
+      res.json({
+        enabled: config.enabled,
+        rootDir: memoryDir(RUNTIME_DATA_DIR),
+        tree,
+      });
     } catch (err) {
-      res
-        .status(500)
-        .json({ error: String(err && err.message ? err.message : err) });
+      res.status(500).json({ error: String((err && err.message) || err) });
     }
   });
 
-  app.put('/api/mcp/servers', async (req, res) => {
-    if (!isLocalSameOrigin(req, resolvedPort)) {
-      return res.status(403).json({ error: 'cross-origin request rejected' });
-    }
+  app.patch('/api/memory/tree/:id', async (req, res) => {
     try {
-      const cfg = await writeMcpConfig(RUNTIME_DATA_DIR, req.body);
-      res.json({ servers: cfg.servers, templates: MCP_TEMPLATES });
+      const body = req.body && typeof req.body === 'object' ? req.body : {};
+      const entry = await updateMemoryTreeNode(
+        RUNTIME_DATA_DIR,
+        req.params.id,
+        body,
+      );
+      const tree = await buildMemoryTree(RUNTIME_DATA_DIR);
+      res.json({ entry, tree });
     } catch (err) {
-      res
-        .status(400)
-        .json({ error: String(err && err.message ? err.message : err) });
+      const message = String((err && err.message) || err);
+      res.status(message === 'memory not found' ? 404 : 400).json({ error: message });
     }
   });
 
-  // ─────────────────────────────────────────────────────────────────
-  // External MCP server OAuth — daemon-owned authorization flow.
+  app.put('/api/memory/index', async (req, res) => {
+    try {
+      const body = req.body && typeof req.body === 'object' ? req.body : {};
+      const index = typeof body.index === 'string' ? body.index : '';
+      await writeMemoryIndex(RUNTIME_DATA_DIR, index);
+      res.json({ index });
+    } catch (err) {
+      res.status(400).json({ error: String((err && err.message) || err) });
+    }
+  });
+
+  app.patch('/api/memory/config', async (req, res) => {
+    try {
+      const body = req.body && typeof req.body === 'object' ? req.body : {};
+      const patch = {};
+      if (typeof body.enabled === 'boolean') patch.enabled = body.enabled;
+      // Three-state extraction handling so the UI can: (a) leave the
+      // override alone (omit `extraction`), (b) clear it back to
+      // auto-pick (`extraction: null`), or (c) commit a custom override
+      // (`extraction: { provider, ... }`). For the apiKey field we
+      // need *four* states because the masked GET surfaces only an
+      // `apiKeyTail` (the secret never round-trips):
+      //   - field absent      → preserve the stored key (UI re-saves
+      //                          a settings form without re-typing
+      //                          the secret).
+      //   - field === ''      → CLEAR the stored key (the picker's
+      //                          drift-resync effect fires this when
+      //                          the user clears their BYOK chat
+      //                          API key — keeping the old daemon-
+      //                          side credential would silently keep
+      //                          calling the provider after the user
+      //                          intentionally removed it from the
+      //                          chat picker, which the reviewer
+      //                          flagged as a credential-sync bug).
+      //   - field === 'sk-…'  → replace with the new key.
+      //   - provider differs  → ignore stored key entirely.
+      if (Object.prototype.hasOwnProperty.call(body, 'extraction')) {
+        if (body.extraction === null) {
+          patch.extraction = null;
+        } else if (body.extraction && typeof body.extraction === 'object') {
+          const incoming = body.extraction;
+          const current = await readMemoryConfig(RUNTIME_DATA_DIR);
+          const apiKeyOmitted = !Object.prototype.hasOwnProperty.call(
+            incoming,
+            'apiKey',
+          );
+          const sameProvider =
+            !!current.extraction
+            && current.extraction.provider === incoming.provider;
+          let nextApiKey = '';
+          if (typeof incoming.apiKey === 'string' && incoming.apiKey) {
+            nextApiKey = incoming.apiKey;
+          } else if (apiKeyOmitted && sameProvider) {
+            nextApiKey = current.extraction.apiKey ?? '';
+          }
+          patch.extraction = {
+            provider: incoming.provider,
+            model:
+              typeof incoming.model === 'string' ? incoming.model : undefined,
+            baseUrl:
+              typeof incoming.baseUrl === 'string'
+                ? incoming.baseUrl
+                : undefined,
+            apiKey: nextApiKey,
+            // Azure-only; ignored by the validator for the other providers.
+            // We forward whatever the UI sent (or the previously-stored
+            // value when the UI omits the field) so re-saving an azure
+            // override without re-typing the api-version doesn't blank it.
+            apiVersion:
+              typeof incoming.apiVersion === 'string'
+                ? incoming.apiVersion
+                : current.extraction?.apiVersion,
+          };
+        }
+      }
+      const next = await writeMemoryConfig(RUNTIME_DATA_DIR, patch);
+      res.json({
+        enabled: next.enabled,
+        extraction: maskMemoryExtractionConfig(next.extraction),
+      });
+    } catch (err) {
+      res.status(400).json({ error: String((err && err.message) || err) });
+    }
+  });
+
+  // SSE feed of memory mutations. The web settings panel subscribes to
+  // this and re-fetches on every event; toast UIs can listen for
+  // `kind === 'extract'` and surface a small "Memory updated (N new)"
+  // notification. Payload shape: MemoryChangeEvent (see ./memory.ts).
   //
-  // Replaces per-spawn `mcp-remote` subprocesses. The token is stored
-  // server-side in <dataDir>/mcp-tokens.json and injected as a Bearer
-  // header into the `.mcp.json` we write for Claude Code at spawn time.
-  // The redirect URI points at THIS daemon's public origin so the flow
-  // works the same in local dev (loopback) and in cloud deployments
-  // where OD_PUBLIC_BASE_URL pins the externally-routable URL.
-  // ─────────────────────────────────────────────────────────────────
+  // The same connection also forwards `extraction` events — one per LLM
+  // extraction phase transition — so the settings panel can render a
+  // live "recent extractions" list. We multiplex on a single SSE stream
+  // so the browser opens one connection instead of two.
+  app.get('/api/memory/events', async (_req, res) => {
+    const sse = createSseResponse(res);
+    sse.send('connected', { at: Date.now() });
+    const onChange = (event) => {
+      sse.send('change', event);
+    };
+    const onExtraction = (event) => {
+      sse.send('extraction', event);
+    };
+    memoryEvents.on('change', onChange);
+    memoryEvents.on('extraction', onExtraction);
+    res.on('close', () => {
+      memoryEvents.off('change', onChange);
+      memoryEvents.off('extraction', onExtraction);
+    });
+  });
 
-  app.post('/api/mcp/oauth/start', async (req, res) => {
-    if (!isLocalSameOrigin(req, resolvedPort)) {
-      return res.status(403).json({ error: 'cross-origin request rejected' });
-    }
-    const serverId =
-      typeof req.body?.serverId === 'string' ? req.body.serverId.trim() : '';
-    if (!serverId) {
-      return res.status(400).json({ error: 'serverId is required' });
-    }
+  // Recent LLM-extraction attempts (newest first; capped server-side).
+  // Surfaces skip reasons, in-flight calls, success counts, and errors
+  // so the settings panel can show "why didn't memory update?" at a
+  // glance instead of leaving the user to guess.
+  app.get('/api/memory/extractions', async (_req, res) => {
     try {
-      const cfg = await readMcpConfig(RUNTIME_DATA_DIR);
-      const server = cfg.servers.find((s) => s.id === serverId);
-      if (!server) {
-        return res.status(404).json({ error: `unknown serverId ${serverId}` });
-      }
-      if (server.transport !== 'http' && server.transport !== 'sse') {
-        return res
-          .status(400)
-          .json({ error: 'OAuth flow only applies to http/sse transports' });
-      }
-      if (!server.url) {
-        return res.status(400).json({ error: 'server has no URL configured' });
-      }
-      const redirectUri = mcpOAuthCallbackUrl(req);
-      console.log(
-        `[mcp-oauth] start serverId=${serverId} url=${server.url} redirect=${redirectUri}`,
-      );
-      const result = await beginAuth({
-        serverId,
-        serverUrl: server.url,
-        redirectUri,
-        dataDir: RUNTIME_DATA_DIR,
-        fetchImpl: fetch,
-      });
-      mcpPendingAuth.put(result.state, result.pending);
-      console.log(
-        `[mcp-oauth] start ok serverId=${serverId} authServer=${result.pending.authServerIssuer} clientId=${result.pending.clientId}`,
-      );
-      res.json({
-        authorizeUrl: result.authorizeUrl,
-        state: result.state,
-        redirectUri,
-      });
+      res.json({ extractions: listMemoryExtractions() });
     } catch (err) {
-      const msg = err && err.message ? err.message : String(err);
-      console.error(`[mcp-oauth] start failed serverId=${serverId}:`, msg);
-      res.status(502).json({ error: msg });
+      res.status(500).json({ error: String(err) });
     }
   });
 
-  // Public endpoint — the OAuth provider's user-agent redirect lands here
-  // after the user approves. We deliberately do NOT enforce
-  // isLocalSameOrigin: in cloud the daemon IS the public origin, and even
-  // locally the request comes back from the OAuth provider's redirect
-  // (no Origin header at all on a top-level navigation).
-  app.get('/api/mcp/oauth/callback', async (req, res) => {
-    const code = typeof req.query.code === 'string' ? req.query.code : '';
-    const state = typeof req.query.state === 'string' ? req.query.state : '';
-    const error = typeof req.query.error === 'string' ? req.query.error : '';
-    if (error) {
-      return res.status(400).type('html').send(renderOAuthResultPage({
-        ok: false,
-        message: `Auth provider returned error: ${error}`,
-      }));
-    }
-    if (!code || !state) {
-      return res.status(400).type('html').send(renderOAuthResultPage({
-        ok: false,
-        message: 'Missing code or state — open Settings → External MCP servers and click Connect again.',
-      }));
-    }
-    const pending = mcpPendingAuth.consume(state);
-    if (!pending) {
-      return res.status(400).type('html').send(renderOAuthResultPage({
-        ok: false,
-        message: 'Auth state expired or already used. Click Connect again.',
-      }));
-    }
+  // Drop the entire extraction history. Registered BEFORE the `:id`
+  // catch-all so a literal "/api/memory/extractions" can still be
+  // cleared with `curl -X DELETE`.
+  app.delete('/api/memory/extractions', async (_req, res) => {
     try {
-      const tokenResp = await exchangeCodeForToken({
-        tokenEndpoint: pending.tokenEndpoint,
-        clientId: pending.clientId,
-        clientSecret: pending.clientSecret,
-        redirectUri: pending.redirectUri,
-        code,
-        codeVerifier: pending.codeVerifier,
-        resource: pending.resourceUrl,
-      });
-      const stored = {
-        accessToken: tokenResp.access_token,
-        refreshToken: tokenResp.refresh_token,
-        tokenType: tokenResp.token_type ?? 'Bearer',
-        scope: tokenResp.scope ?? pending.scope,
-        expiresAt:
-          typeof tokenResp.expires_in === 'number'
-            ? Date.now() + tokenResp.expires_in * 1000
-            : undefined,
-        savedAt: Date.now(),
-        // Persist the OAuth client context so refresh-token rotation can
-        // hit the same client_id / token endpoint the upstream issued the
-        // refresh_token to. Refresh tokens are client-bound (RFC 6749 §6).
-        tokenEndpoint: pending.tokenEndpoint,
-        clientId: pending.clientId,
-        clientSecret: pending.clientSecret,
-        authServerIssuer: pending.authServerIssuer,
-        redirectUri: pending.redirectUri,
-        resourceUrl: pending.resourceUrl,
-      };
-      await setToken(RUNTIME_DATA_DIR, pending.serverId, stored);
-      res.type('html').send(renderOAuthResultPage({
-        ok: true,
-        serverId: pending.serverId,
-      }));
+      const removed = clearMemoryExtractions();
+      res.json({ removed });
     } catch (err) {
-      console.error(
-        '[mcp-oauth] callback failed:',
-        err && err.message ? err.message : err,
+      res.status(400).json({ error: String((err && err.message) || err) });
+    }
+  });
+
+  app.delete('/api/memory/extractions/:id', async (req, res) => {
+    try {
+      const removed = removeMemoryExtraction(req.params.id);
+      res.json({ removed });
+    } catch (err) {
+      res.status(400).json({ error: String((err && err.message) || err) });
+    }
+  });
+
+  // Imperative extract — used by CLI chats internally and by BYOK /
+  // API-mode chats from the web app, which never reach the chat-run
+  // path on the daemon. Mirrors the two-phase hook the daemon's chat
+  // route applies inline:
+  //
+  //   - Pre-turn (only `userMessage` supplied): run the synchronous
+  //     heuristic regex pack so explicit "remember: X" / "我是 X"
+  //     markers land in memory before the prompt is composed, and the
+  //     same turn's assistant reply already reflects them.
+  //   - Post-turn (`userMessage` + `assistantMessage` supplied): queue
+  //     the LLM extractor in the background — it speaks SSE /
+  //     extraction-history on its own and may take several seconds, so
+  //     we don't block the HTTP response on it. The heuristic is
+  //     skipped on this branch because the caller already ran it
+  //     pre-turn; running it twice would double the
+  //     `recordHeuristic({...})` rows in the extraction history for
+  //     every turn.
+  //
+  // External callers (curl, replay tools) that pass only
+  // `userMessage` keep the legacy behaviour: heuristic-only.
+  app.post('/api/memory/extract', async (req, res) => {
+    try {
+      const body = req.body && typeof req.body === 'object' ? req.body : {};
+      const userMessage =
+        typeof body.userMessage === 'string' ? body.userMessage : '';
+      const assistantMessage =
+        typeof body.assistantMessage === 'string' ? body.assistantMessage : '';
+      const hasAssistant = assistantMessage.trim().length > 0;
+      const changed = hasAssistant
+        ? []
+        : await extractFromMessage(RUNTIME_DATA_DIR, userMessage);
+      // BYOK chat config — only forwarded by the web app for API-mode
+      // chats. We strip the surface to the five fields pickProvider()
+      // actually consumes and validate the provider against the four
+      // shapes the extractor speaks; an unknown / missing provider
+      // means "let the legacy chain decide" so a malformed payload
+      // can't override the env / media-config fallbacks.
+      const rawChat = body.chatProvider;
+      let chatProvider = null;
+      if (rawChat && typeof rawChat === 'object') {
+        const provider = rawChat.provider;
+        if (
+          provider === 'anthropic'
+          || provider === 'openai'
+          || provider === 'azure'
+          || provider === 'google'
+          || provider === 'ollama'
+        ) {
+          chatProvider = {
+            provider,
+            apiKey: typeof rawChat.apiKey === 'string' ? rawChat.apiKey : '',
+            baseUrl: typeof rawChat.baseUrl === 'string' ? rawChat.baseUrl : '',
+            apiVersion:
+              typeof rawChat.apiVersion === 'string' ? rawChat.apiVersion : '',
+            model: typeof rawChat.model === 'string' ? rawChat.model : '',
+          };
+        }
+      }
+      let attemptedLLM = false;
+      if (userMessage.trim().length > 0 && hasAssistant) {
+        attemptedLLM = true;
+        void import('./memory-llm.js')
+          .then(({ extractWithLLM }) =>
+            extractWithLLM(
+              RUNTIME_DATA_DIR,
+              { userMessage, assistantMessage },
+              {
+                projectRoot: PROJECT_ROOT,
+                chatAgentId: null,
+                chatProvider,
+              },
+            ),
+          )
+          .catch((err) =>
+            console.warn('[memory-llm] background failed (http extract)', err),
+          );
+      }
+      res.json({ changed, attemptedLLM });
+    } catch (err) {
+      res.status(400).json({ error: String((err && err.message) || err) });
+    }
+  });
+
+  // Composed memory body for the system prompt. Daemon-side chat runs
+  // call `composeMemoryBody()` directly; the web app (BYOK / API mode)
+  // can't import daemon internals, so this endpoint exposes the same
+  // string the daemon would have folded into the system prompt for a
+  // CLI run. `ProjectView.composedSystemPrompt()` calls it before each
+  // BYOK turn and passes the result into `composeSystemPrompt`'s
+  // `memoryBody` field — without this, the Memory tab is a no-op for
+  // BYOK users even though the UI saves model/index/entries for them.
+  app.get('/api/memory/system-prompt', async (_req, res) => {
+    try {
+      const body = await composeMemoryBody(RUNTIME_DATA_DIR);
+      res.json({ body });
+    } catch (err) {
+      res.status(500).json({ error: String((err && err.message) || err) });
+    }
+  });
+
+  app.get('/api/automation-source-packets', async (req, res) => {
+    try {
+      const limit = typeof req.query.limit === 'string' ? Number(req.query.limit) : undefined;
+      const packets = await listAutomationSourcePackets(RUNTIME_DATA_DIR, { limit });
+      res.json({ packets });
+    } catch (err) {
+      res.status(500).json({ error: String((err && err.message) || err) });
+    }
+  });
+
+  app.post('/api/automation-ingestions', async (req, res) => {
+    try {
+      const body = req.body && typeof req.body === 'object' ? req.body : {};
+      const result = await ingestAutomationSource(RUNTIME_DATA_DIR, body);
+      res.json(result);
+    } catch (err) {
+      res.status(400).json({ error: String((err && err.message) || err) });
+    }
+  });
+
+  app.get('/api/automation-source-packets/:id', async (req, res) => {
+    try {
+      const packet = await getAutomationSourcePacket(RUNTIME_DATA_DIR, req.params.id);
+      if (!packet) return res.status(404).json({ error: 'automation source packet not found' });
+      res.json({ packet });
+    } catch (err) {
+      res.status(400).json({ error: String((err && err.message) || err) });
+    }
+  });
+
+  app.get('/api/automation-proposals', async (req, res) => {
+    try {
+      const rawStatus = typeof req.query.status === 'string' ? req.query.status : 'all';
+      const proposals = await listAutomationProposals(RUNTIME_DATA_DIR, {
+        status: rawStatus,
+      });
+      res.json({ proposals });
+    } catch (err) {
+      res.status(500).json({ error: String((err && err.message) || err) });
+    }
+  });
+
+  app.post('/api/automation-proposals', async (req, res) => {
+    try {
+      const body = req.body && typeof req.body === 'object' ? req.body : {};
+      const proposal = await createAutomationProposal(RUNTIME_DATA_DIR, body);
+      res.json({ proposal });
+    } catch (err) {
+      res.status(400).json({ error: String((err && err.message) || err) });
+    }
+  });
+
+  app.get('/api/automation-proposals/:id', async (req, res) => {
+    try {
+      const proposal = await getAutomationProposal(RUNTIME_DATA_DIR, req.params.id);
+      if (!proposal) return res.status(404).json({ error: 'automation proposal not found' });
+      res.json({ proposal });
+    } catch (err) {
+      res.status(400).json({ error: String((err && err.message) || err) });
+    }
+  });
+
+  app.post('/api/automation-proposals/:id/apply', async (req, res) => {
+    try {
+      const result = await applyAutomationProposal(RUNTIME_DATA_DIR, req.params.id);
+      res.json(result);
+    } catch (err) {
+      const message = String((err && err.message) || err);
+      const status = message.includes('not found') ? 404 : 400;
+      res.status(status).json({ error: message });
+    }
+  });
+
+  app.post('/api/automation-proposals/:id/reject', async (req, res) => {
+    try {
+      const body = req.body && typeof req.body === 'object' ? req.body : {};
+      const proposal = await rejectAutomationProposal(
+        RUNTIME_DATA_DIR,
+        req.params.id,
+        typeof body.reason === 'string' ? body.reason : undefined,
       );
-      res.status(502).type('html').send(renderOAuthResultPage({
-        ok: false,
-        message: String(err && err.message ? err.message : err),
-      }));
-    }
-  });
-
-  app.get('/api/mcp/oauth/status', async (req, res) => {
-    if (!isLocalSameOrigin(req, resolvedPort)) {
-      return res.status(403).json({ error: 'cross-origin request rejected' });
-    }
-    const serverId =
-      typeof req.query.serverId === 'string' ? req.query.serverId.trim() : '';
-    if (!serverId) return res.status(400).json({ error: 'serverId is required' });
-    try {
-      const tok = await getToken(RUNTIME_DATA_DIR, serverId);
-      if (!tok) return res.json({ connected: false });
-      res.json({
-        connected: true,
-        expiresAt: tok.expiresAt ?? null,
-        scope: tok.scope ?? null,
-        savedAt: tok.savedAt,
-      });
+      res.json({ proposal });
     } catch (err) {
-      res.status(500).json({ error: String(err && err.message ? err.message : err) });
+      const message = String((err && err.message) || err);
+      const status = message.includes('not found') ? 404 : 400;
+      res.status(status).json({ error: message });
     }
   });
 
-  app.post('/api/mcp/oauth/disconnect', async (req, res) => {
-    if (!isLocalSameOrigin(req, resolvedPort)) {
-      return res.status(403).json({ error: 'cross-origin request rejected' });
-    }
-    const serverId =
-      typeof req.body?.serverId === 'string' ? req.body.serverId.trim() : '';
-    if (!serverId) return res.status(400).json({ error: 'serverId is required' });
+  app.post('/api/memory', async (req, res) => {
     try {
-      await clearToken(RUNTIME_DATA_DIR, serverId);
+      const body = req.body && typeof req.body === 'object' ? req.body : {};
+      const entry = await upsertMemoryEntry(RUNTIME_DATA_DIR, body);
+      res.json({ entry });
+    } catch (err) {
+      res.status(400).json({ error: String((err && err.message) || err) });
+    }
+  });
+
+  app.get('/api/memory/:id', async (req, res) => {
+    try {
+      const entry = await readMemoryEntry(RUNTIME_DATA_DIR, req.params.id);
+      if (!entry) return res.status(404).json({ error: 'memory not found' });
+      res.json({ entry });
+    } catch (err) {
+      res.status(400).json({ error: String((err && err.message) || err) });
+    }
+  });
+
+  app.put('/api/memory/:id', async (req, res) => {
+    try {
+      const body = req.body && typeof req.body === 'object' ? req.body : {};
+      const entry = await upsertMemoryEntry(RUNTIME_DATA_DIR, {
+        ...body,
+        id: req.params.id,
+      });
+      res.json({ entry });
+    } catch (err) {
+      res.status(400).json({ error: String((err && err.message) || err) });
+    }
+  });
+
+  app.delete('/api/memory/:id', async (req, res) => {
+    try {
+      await deleteMemoryEntry(RUNTIME_DATA_DIR, req.params.id);
       res.json({ ok: true });
     } catch (err) {
-      res.status(500).json({ error: String(err && err.message ? err.message : err) });
+      res.status(400).json({ error: String((err && err.message) || err) });
     }
   });
 
-  app.get('/api/projects', (_req, res) => {
+  // Reconcile follow-up — the inline POST /api/projects body that lived
+  // on garnet (with baseDir privilege check, linkedDirs validation,
+  // template snapshot seeding, plugin snapshot resolution with default
+  // scenario fallback) is intentionally dropped here. main moved project
+  // route registration into `./project-routes.js` via PR #1043, so the
+  // simple project-create surface is wired through `registerProjectRoutes`
+  // further down. Plugin-snapshot-resolution / default-scenario-fallback
+  // from garnet need to be re-integrated into project-routes.ts as a
+  // follow-up — see reconcile decision log.
+  // (legacy POST /api/projects body deleted — see registerProjectRoutes below.)
+
+  const analyticsService = createAnalyticsService({ dataDir: RUNTIME_DATA_DIR });
+  const design = {
+    runs: createChatRunService({ createSseResponse, createSseErrorPayload }),
+    analytics: analyticsService,
+    getAppVersion: () => cachedAppVersion?.version ?? '0.0.0',
+    readAnalyticsContext,
+  };
+
+  // PostHog runtime config — gated on BOTH a server-side key (POSTHOG_KEY)
+  // and the user's opt-in metrics consent (Privacy → "Share usage data").
+  // The web bundle short-circuits when enabled=false so opt-out behaviour
+  // is instant after the user toggles metrics off and reloads.
+  app.get('/api/analytics/config', async (_req, res) => {
+    const baseline = readPublicConfigResponse();
+    if (!baseline.enabled) {
+      res.json(baseline);
+      return;
+    }
     try {
-      const latestRunStatuses = listLatestProjectRunStatuses(db);
-      const awaitingInputProjects = listProjectsAwaitingInput(db);
-      const activeRunStatuses = new Map();
-      for (const run of design.runs.list()) {
-        if (!run.projectId) continue;
-        const runStatus = projectStatusFromRun(run);
-        if (design.runs.isTerminal(run.status)) {
-          const existing = latestRunStatuses.get(run.projectId);
-          if (!existing || run.updatedAt > (existing.updatedAt ?? 0)) {
-            latestRunStatuses.set(run.projectId, runStatus);
-          }
-        } else {
-          const existing = activeRunStatuses.get(run.projectId);
-          if (!existing || run.updatedAt > (existing.updatedAt ?? 0)) {
-            activeRunStatuses.set(run.projectId, runStatus);
-          }
-        }
+      const appCfg = await readAppConfig(RUNTIME_DATA_DIR);
+      const consentGranted = appCfg.telemetry?.metrics === true;
+      if (!consentGranted) {
+        res.json({ enabled: false, key: null, host: null });
+        return;
       }
-      /** @type {import('@open-design/contracts').ProjectsResponse} */
-      const body = {
-        projects: listProjects(db).map((project) => ({
-          ...project,
-          status: composeProjectDisplayStatus(
-            activeRunStatuses.get(project.id) ??
-              latestRunStatuses.get(project.id) ?? { value: 'not_started' },
-            awaitingInputProjects,
-            project.id,
-          ),
-        })),
-      };
-      res.json(body);
-    } catch (err) {
-      sendApiError(res, 500, 'INTERNAL_ERROR', String(err));
+      // Echo the installationId so the web client uses the same anonymous
+      // id PostHog already saw on prior runs (and that Langfuse uses too).
+      const installationId =
+        typeof appCfg.installationId === 'string' && appCfg.installationId
+          ? appCfg.installationId
+          : null;
+      res.json({ ...baseline, installationId });
+    } catch {
+      // If the config file is unreadable, fail closed — no events.
+      res.json({ enabled: false, key: null, host: null });
     }
   });
 
-  function projectStatusFromRun(run) {
-    return {
-      value: normalizeProjectDisplayStatus(run.status),
-      updatedAt: run.updatedAt,
-      runId: run.id,
-    };
-  }
+  // Tracks runs whose completion has already been forwarded to Langfuse so
+  // repeated message updates only emit one trace per run.
+  const reportedRuns = new Set();
 
-  app.post('/api/projects', async (req, res) => {
+  // App-version snapshot read once at server start for Langfuse trace metadata.
+  let cachedAppVersion = null;
+  void (async () => {
     try {
-      const { id, name, skillId, designSystemId, pendingPrompt, metadata } =
-        req.body || {};
-      if (typeof id !== 'string' || !/^[A-Za-z0-9._-]{1,128}$/.test(id)) {
-        return sendApiError(res, 400, 'BAD_REQUEST', 'invalid project id');
-      }
-      if (typeof name !== 'string' || !name.trim()) {
-        return sendApiError(res, 400, 'BAD_REQUEST', 'name required');
-      }
-      // baseDir is privileged: it lets a project root directly inside the
-      // user's filesystem. The /api/import/folder endpoint is the only
-      // path that's allowed to set it, because that's where realpath() +
-      // RUNTIME_DATA_DIR reentry checks live. Block client-supplied
-      // metadata.baseDir on this generic create endpoint so an attacker
-      // can't smuggle e.g. /etc through here. Same rule for
-      // originalBaseDir / importedFrom='folder' — only the import path
-      // owns those state fields.
-      if (metadata && typeof metadata === 'object') {
-        if ('baseDir' in metadata) {
-          return sendApiError(
-            res, 400, 'BAD_REQUEST',
-            'baseDir can only be set via POST /api/import/folder',
-          );
-        }
-      }
-      const now = Date.now();
-      const project = insertProject(db, {
-        id,
-        name: name.trim(),
-        skillId: skillId ?? null,
-        designSystemId: designSystemId ?? null,
-        pendingPrompt: pendingPrompt || null,
-        metadata:
-          metadata && typeof metadata === 'object'
-            ? {
-                ...metadata,
-                ...(Array.isArray(metadata.linkedDirs)
-                  ? (() => {
-                      const v = validateLinkedDirs(metadata.linkedDirs);
-                      return v.error ? {} : { linkedDirs: v.dirs };
-                    })()
-                  : {}),
-              }
-            : null,
-        createdAt: now,
-        updatedAt: now,
-      });
-      // Seed a default conversation so the UI always has somewhere to write.
-      const cid = randomId();
-      insertConversation(db, {
-        id: cid,
-        projectId: id,
-        title: null,
-        createdAt: now,
-        updatedAt: now,
-      });
-      // For "from template" projects, seed the chosen template's snapshot
-      // HTML into the new project folder so the agent can Read/edit files
-      // on disk (the system prompt also embeds them, but a real on-disk
-      // copy lets the agent treat them as the project's working state).
-      if (
-        metadata &&
-        typeof metadata === 'object' &&
-        metadata.kind === 'template' &&
-        typeof metadata.templateId === 'string'
-      ) {
-        const tpl = getTemplate(db, metadata.templateId);
-        if (tpl && Array.isArray(tpl.files) && tpl.files.length > 0) {
-          await ensureProject(PROJECTS_DIR, id);
-          for (const f of tpl.files) {
-            if (
-              !f ||
-              typeof f.name !== 'string' ||
-              typeof f.content !== 'string'
-            ) {
-              continue;
-            }
-            try {
-              await writeProjectFile(
-                PROJECTS_DIR,
-                id,
-                f.name,
-                Buffer.from(f.content, 'utf8'),
-              );
-            } catch {
-              // Skip individual file failures — the template snapshot is
-              // best-effort; the agent still has the embedded copy.
-            }
-          }
-        }
-      }
-      /** @type {import('@open-design/contracts').CreateProjectResponse} */
-      const body = { project, conversationId: cid };
-      res.json(body);
-    } catch (err) {
-      sendApiError(res, 400, 'BAD_REQUEST', String(err));
+      cachedAppVersion = await readCurrentAppVersionInfo();
+    } catch {
+      // Telemetry is best-effort; appVersion is omitted when unavailable.
     }
+  })();
+
+  const reportFinalizedMessage = createFinalizedMessageTelemetryReporter({
+    design,
+    db,
+    dataDir: RUNTIME_DATA_DIR,
+    reportedRuns,
+    getAppVersion: () => cachedAppVersion,
   });
 
-  app.post(
-    '/api/import/claude-design',
-    importUpload.single('file'),
-    async (req, res) => {
-      try {
-        if (!req.file)
-          return res.status(400).json({ error: 'zip file required' });
-        const originalName =
-          req.file.originalname || 'Claude Design export.zip';
-        if (!/\.zip$/i.test(originalName)) {
-          fs.promises.unlink(req.file.path).catch(() => {});
-          return res.status(400).json({ error: 'expected a .zip file' });
-        }
-        const id = randomId();
-        const now = Date.now();
-        const baseName =
-          originalName.replace(/\.zip$/i, '').trim() || 'Claude Design import';
-        const imported = await importClaudeDesignZip(
-          req.file.path,
-          projectDir(PROJECTS_DIR, id),
-        );
-        fs.promises.unlink(req.file.path).catch(() => {});
+  // DNS-aware wrapper. The sync `validateBaseUrl` only inspects the literal
+  // hostname string, so a public DNS name pointing at an internal address
+  // (`internal.example.com → 10.0.0.5`) still passes. We delegate to
+  // `validateBaseUrlResolved` here so every proxy and finalize handler runs
+  // the same resolved-IP check before issuing the upstream request.
+  const validateExternalApiBaseUrl = (baseUrl) => validateBaseUrlResolved(baseUrl);
 
-        const project = insertProject(db, {
-          id,
-          name: baseName,
-          skillId: null,
-          designSystemId: null,
-          pendingPrompt: `Imported from Claude Design ZIP: ${originalName}. Continue editing ${imported.entryFile}.`,
-          metadata: {
-            kind: 'prototype',
-            importedFrom: 'claude-design',
-            entryFile: imported.entryFile,
-            sourceFileName: originalName,
-          },
-          createdAt: now,
-          updatedAt: now,
-        });
-        const cid = randomId();
-        insertConversation(db, {
-          id: cid,
-          projectId: id,
-          title: 'Imported Claude Design project',
-          createdAt: now,
-          updatedAt: now,
-        });
-        setTabs(db, id, [imported.entryFile], imported.entryFile);
-        res.json({
-          project,
-          conversationId: cid,
-          entryFile: imported.entryFile,
-          files: imported.files,
-        });
-      } catch (err) {
-        if (req.file?.path) fs.promises.unlink(req.file.path).catch(() => {});
-        res.status(400).json({ error: String(err) });
-      }
+  const resolvedPortRef = {
+    get current() {
+      return resolvedPort;
     },
-  );
+  };
+  const daemonUrlRef = {
+    get current() {
+      return daemonUrl;
+    },
+  };
+  const httpDeps = {
+    sendApiError,
+    sendMulterError,
+    sendLiveArtifactRouteError,
+    createSseResponse,
+    requireLocalDaemonRequest,
+    isLocalSameOrigin,
+    resolvedPortRef,
+  };
+  const pathDeps = {
+    PROJECT_ROOT,
+    PROJECTS_DIR,
+    ARTIFACTS_DIR,
+    RUNTIME_DATA_DIR,
+    RUNTIME_DATA_DIR_CANONICAL,
+    DESIGN_SYSTEMS_DIR,
+    USER_DESIGN_SYSTEMS_DIR,
+    DESIGN_TEMPLATES_DIR,
+    USER_DESIGN_TEMPLATES_DIR,
+    SKILLS_DIR,
+    USER_SKILLS_DIR,
+    PROMPT_TEMPLATES_DIR,
+    BUNDLED_PETS_DIR,
+    OD_BIN,
+  };
+  const nodeDeps = { fs, path };
+  const idDeps = { randomId, randomUUID };
+  const uploadDeps = { upload, importUpload, handleProjectUpload };
+  const projectStoreDeps = {
+    getProject,
+    insertProject,
+    updateProject,
+    dbDeleteProject,
+    removeProjectDir,
+    validateLinkedDirs,
+  };
+  const projectFileDeps = {
+    ensureProject,
+    listFiles,
+    searchProjectFiles,
+    readProjectFile,
+    resolveProjectDir,
+    resolveProjectFilePath,
+    parseByteRange,
+    renameProjectFile,
+    deleteProjectFile,
+    writeProjectFile,
+    sanitizeName,
+    listTabs,
+    setTabs,
+  };
+  const conversationDeps = {
+    insertConversation,
+    getConversation,
+    listConversations,
+    updateConversation,
+    deleteConversation,
+    listMessages,
+    upsertMessage,
+    listPreviewComments,
+    upsertPreviewComment,
+    updatePreviewCommentStatus,
+    deletePreviewComment,
+  };
+  const templateDeps = { getTemplate, listTemplates, deleteTemplate, insertTemplate, findTemplateByNameAndProject, updateTemplate };
+  const projectStatusDeps = {
+    listLatestProjectRunStatuses,
+    listProjectsAwaitingInput,
+    normalizeProjectDisplayStatus,
+    composeProjectDisplayStatus,
+    listProjects,
+  };
+  const projectEventDeps = { subscribeFileEvents, activeProjectEventSinks };
+  const importDeps = { importClaudeDesignZip, projectDir, detectEntryFile };
+  const projectExportDeps = {
+    buildProjectArchive,
+    buildBatchArchive,
+    buildDesktopPdfExportInput,
+    desktopPdfExporter,
+    daemonUrlRef,
+    sanitizeArchiveFilename,
+  };
+  const artifactDeps = {
+    sanitizeSlug,
+    lintArtifact,
+    renderFindingsForAgent,
+    validateArtifactManifestInput,
+  };
+  const deployDeps = {
+    VERCEL_PROVIDER_ID,
+    CLOUDFLARE_PAGES_PROVIDER_ID,
+    isDeployProviderId,
+    publicDeployConfigForProvider,
+    readDeployConfig,
+    writeDeployConfig,
+    listCloudflarePagesZones,
+    DeployError,
+    listDeployments,
+    publicDeployments,
+    getDeployment,
+    getDeploymentById,
+    buildDeployFileSet,
+    cloudflarePagesProjectNameForDeploy,
+    cloudflarePagesProjectNameFromDeployment,
+    checkCloudflarePagesDeploymentLinks,
+    checkDeploymentUrl,
+    deployToCloudflarePages,
+    deployToVercel,
+    upsertDeployment,
+    publicDeployment,
+    cloudflarePagesDeploymentMetadata,
+    prepareDeployPreflight,
+  };
+  const mediaDeps = {
+    MEDIA_PROVIDERS,
+    IMAGE_MODELS,
+    VIDEO_MODELS,
+    AUDIO_MODELS_BY_KIND,
+    MEDIA_ASPECTS,
+    VIDEO_LENGTHS_SEC,
+    AUDIO_DURATIONS_SEC,
+    readMaskedConfig,
+    writeConfig,
+    generateMedia,
+    mediaTasks,
+    createMediaTask: (taskId, projectId, info) => createMediaTask(db, taskId, projectId, info),
+    persistMediaTask: (task) => persistMediaTask(db, task),
+    appendTaskProgress: (task, line) => appendTaskProgress(db, task, line),
+    notifyTaskWaiters: (task) => notifyTaskWaiters(db, task),
+    getLiveMediaTask: (taskId) => getLiveMediaTask(db, taskId),
+    mediaTaskSnapshot,
+    listMediaTasksByProject,
+    listElevenLabsVoiceOptions,
+  };
+  const appConfigDeps = { readAppConfig, writeAppConfig };
+  const orbitDeps = { orbitService };
+  const nativeDialogDeps = { openNativeFolderDialog };
+  const researchDeps = { searchResearch, ResearchError };
+  const liveArtifactDeps = {
+    createLiveArtifact,
+    listLiveArtifacts,
+    updateLiveArtifact,
+    refreshLiveArtifact,
+    emitLiveArtifactEvent,
+    emitLiveArtifactRefreshEvent,
+    readLiveArtifactCode,
+    setLiveArtifactCodeHeaders,
+    ensureLiveArtifactPreview,
+    setLiveArtifactPreviewHeaders,
+    getLiveArtifact,
+    listLiveArtifactRefreshLogEntries,
+    deleteLiveArtifact,
+  };
+  const authDeps = {
+    authorizeToolRequest,
+    consumedImportNonces,
+    desktopAuthSecret: getDesktopAuthSecret,
+    isDesktopAuthGateActive,
+    pruneExpiredImportNonces,
+    requestProjectOverride,
+    requestRunOverride,
+    verifyDesktopImportToken,
+  };
+  const finalizeDeps = {
+    defaultBaseUrlForFinalizeProtocol,
+    finalizeDesignPackage,
+    FinalizePackageLockedError,
+    FinalizeUpstreamError,
+    isFinalizeProviderProtocol,
+    redactSecrets,
+  };
+  const validationDeps = { isSafeId, validateExternalApiBaseUrl, validateBaseUrl, validateProjectDesignSystemId };
+  const agentDeps = {
+    listProviderModels,
+    testProviderConnection,
+    testAgentConnection,
+    getAgentDef,
+    isKnownModel,
+    sanitizeCustomModel,
+  };
+  const critiqueDeps = {
+    handleCritiqueArtifact,
+    handleCritiqueInterrupt,
+    critiqueArtifactsRoot: CRITIQUE_ARTIFACTS_DIR,
+    critiqueResponseCapBytes: critiqueCfg.parserMaxBlockBytes,
+    critiqueRunRegistry,
+  };
 
-  // Import an existing local folder as a project. The user picks a folder
-  // and OD works inside it directly: every write goes to metadata.baseDir.
-  // No copy, no shadow tree — the user owns the workspace and is
-  // responsible for their own version control (git, time machine, etc.),
-  // mirroring how Cursor / Claude Code / Aider behave.
-  app.post('/api/import/folder', async (req, res) => {
-    try {
-      const { baseDir, name, skillId, designSystemId } = req.body || {};
-      if (typeof baseDir !== 'string' || !baseDir.trim()) {
-        return sendApiError(res, 400, 'BAD_REQUEST', 'baseDir required');
-      }
-      const trimmedInput = baseDir.trim();
-      if (!path.isAbsolute(path.normalize(trimmedInput))) {
-        return sendApiError(res, 400, 'BAD_REQUEST', 'baseDir must be absolute');
-      }
-      // Resolve symlinks once at import and persist the canonical path.
-      // Without this, a user-controlled symlink (e.g. ~/sneaky → /etc) at
-      // baseDir would let writeProjectFile escape the project sandbox at
-      // every later call: resolveSafe checks the *literal* baseDir, but
-      // the OS follows the symlink at write time. realpath() collapses
-      // the chain so the stored baseDir == what the kernel will write to.
-      let normalizedPath: string;
-      try {
-        normalizedPath = await fs.promises.realpath(trimmedInput);
-      } catch {
-        return sendApiError(res, 400, 'BAD_REQUEST', 'folder not found');
-      }
-      // realpath resolved → lstat the canonical path to ensure it's a
-      // real directory, not another symlink (defense-in-depth).
-      let dirStat;
-      try {
-        dirStat = await fs.promises.lstat(normalizedPath);
-      } catch {
-        return sendApiError(res, 400, 'BAD_REQUEST', 'folder not found');
-      }
-      if (!dirStat.isDirectory()) {
-        return sendApiError(res, 400, 'BAD_REQUEST', 'path must be a directory');
-      }
-      // Prevent importing the data directory into itself (post-realpath so
-      // a symlink pointing into RUNTIME_DATA_DIR is also caught). Compare
-      // against the canonical alias because `normalizedPath` is the import
-      // folder's realpath; on macOS the data dir at /var/... resolves to
-      // /private/var/... and would never start-with the user-shaped path.
-      if (
-        normalizedPath === RUNTIME_DATA_DIR_CANONICAL ||
-        normalizedPath.startsWith(RUNTIME_DATA_DIR_CANONICAL + path.sep)
-      ) {
-        return sendApiError(res, 400, 'BAD_REQUEST', 'cannot import the data directory');
-      }
-
-      const id = randomId();
-      const now = Date.now();
-      const projectName =
-        typeof name === 'string' && name.trim()
-          ? name.trim()
-          : path.basename(normalizedPath);
-      const entryFile = await detectEntryFile(normalizedPath);
-
-      const project = insertProject(db, {
-        id,
-        name: projectName,
-        skillId: skillId ?? null,
-        designSystemId: designSystemId ?? null,
-        pendingPrompt: null,
-        metadata: {
-          kind: 'prototype',
-          baseDir: normalizedPath,
-          importedFrom: 'folder',
-          entryFile,
-        },
-        createdAt: now,
-        updatedAt: now,
-      });
-
-      const cid = randomId();
-      insertConversation(db, {
-        id: cid,
-        projectId: id,
-        title: `Imported from ${projectName}`,
-        createdAt: now,
-        updatedAt: now,
-      });
-      if (entryFile) setTabs(db, id, [entryFile], entryFile);
-      /** @type {import('@open-design/contracts').ImportFolderResponse} */
-      const body = { project, conversationId: cid, entryFile };
-      res.json(body);
-    } catch (err) {
-      sendApiError(res, 400, 'BAD_REQUEST', String(err));
-    }
+  // External services
+  registerMcpRoutes(app, {
+    http: httpDeps,
+    paths: pathDeps,
+    mcp: { pendingAuth: mcpPendingAuth, daemonUrlRef },
+  });
+  registerXaiRoutes(app, {
+    http: httpDeps,
+    paths: pathDeps,
+  });
+  // Project workspace
+  registerActiveContextRoutes(app, {
+    db,
+    http: httpDeps,
+    projectStore: projectStoreDeps,
+  });
+  registerProjectRoutes(app, {
+    db,
+    design,
+    http: httpDeps,
+    paths: pathDeps,
+    projectStore: projectStoreDeps,
+    projectFiles: projectFileDeps,
+    conversations: conversationDeps,
+    templates: templateDeps,
+    status: projectStatusDeps,
+    events: projectEventDeps,
+    ids: idDeps,
+    telemetry: { reportFinalizedMessage },
+    validation: validationDeps,
+  });
+  registerImportRoutes(app, {
+    db,
+    http: httpDeps,
+    uploads: uploadDeps,
+    node: nodeDeps,
+    ids: idDeps,
+    paths: pathDeps,
+    imports: importDeps,
+    auth: authDeps,
+    projectStore: projectStoreDeps,
+    conversations: conversationDeps,
+    projectFiles: projectFileDeps,
+    validation: validationDeps,
   });
 
-  app.get('/api/projects/:id', (req, res) => {
-    const project = getProject(db, req.params.id);
-    if (!project)
-      return sendApiError(res, 404, 'PROJECT_NOT_FOUND', 'not found');
-    /** @type {import('@open-design/contracts').ProjectResponse} */
-    const body = { project };
-    res.json(body);
+  // Resource catalog
+  registerStaticResourceRoutes(app, {
+    http: httpDeps,
+    paths: pathDeps,
+    resources: {
+      listAllSkills,
+      listAllDesignTemplates,
+      listAllSkillLikeEntries,
+      listAllDesignSystems,
+      mimeFor,
+    },
+  });
+  registerProjectArtifactRoutes(app, {
+    http: httpDeps,
+    uploads: uploadDeps,
+    paths: pathDeps,
+    node: nodeDeps,
+    artifacts: artifactDeps,
+  });
+  registerLiveArtifactRoutes(app, {
+    db,
+    http: httpDeps,
+    paths: pathDeps,
+    auth: authDeps,
+    liveArtifacts: liveArtifactDeps,
+    projectStore: projectStoreDeps,
+  });
+  registerDesignSystemToolRoutes(app, {
+    auth: authDeps,
+    http: httpDeps,
+    paths: pathDeps,
+    projects: { getProject },
+  });
+  app.use('/artifacts', express.static(ARTIFACTS_DIR));
+  registerDeployRoutes(app, {
+    db,
+    http: httpDeps,
+    paths: pathDeps,
+    ids: idDeps,
+    deploy: deployDeps,
+    projectStore: projectStoreDeps,
+  });
+  registerFinalizeRoutes(app, {
+    db,
+    http: httpDeps,
+    paths: pathDeps,
+    projectStore: projectStoreDeps,
+    validation: validationDeps,
+    finalize: finalizeDeps,
+  });
+  registerDeploymentCheckRoutes(app, { db, http: httpDeps, deploy: deployDeps });
+  app.use('/frames', express.static(FRAMES_DIR));
+  registerProjectExportRoutes(app, {
+    db,
+    http: httpDeps,
+    paths: pathDeps,
+    projectStore: projectStoreDeps,
+    exports: projectExportDeps,
+    projectFiles: projectFileDeps,
+    validation: validationDeps,
+  });
+  registerProjectFileRoutes(app, {
+    db,
+    http: httpDeps,
+    paths: pathDeps,
+    uploads: uploadDeps,
+    node: nodeDeps,
+    projectStore: projectStoreDeps,
+    projectFiles: projectFileDeps,
+    documents: { buildDocumentPreview },
+    artifacts: artifactDeps,
   });
 
-  app.patch('/api/projects/:id', (req, res) => {
-    try {
-      const patch = req.body || {};
-      // baseDir / folder-import state is privileged: it's set only by the
-      // import endpoint and otherwise immutable. Two failure modes to
-      // guard against here:
-      //   1. Explicit attempt to change baseDir → reject with 400.
-      //   2. A regular metadata patch that *omits* baseDir (e.g. a UI
-      //      that only edits linkedDirs sends `{ metadata: { kind, linkedDirs } }`).
-      //      updateProject() replaces metadata wholesale, so without
-      //      preservation the existing baseDir gets wiped and the project
-      //      detaches from the user's folder — subsequent reads/writes
-      //      silently fall back to .od/projects/<id>.
-      // For case 2 we re-stamp the immutable fields from the existing
-      // project record onto the incoming patch so the user can keep
-      // patching other metadata without ever losing their import root.
-      if (patch.metadata && typeof patch.metadata === 'object') {
-        const existing = getProject(db, req.params.id);
-        const existingMeta = existing?.metadata;
-        if (existingMeta?.baseDir) {
-          if ('baseDir' in patch.metadata && patch.metadata.baseDir !== existingMeta.baseDir) {
-            return sendApiError(
-              res, 400, 'BAD_REQUEST',
-              'baseDir is immutable after import; use a new import to change it',
-            );
-          }
-          patch.metadata = {
-            ...patch.metadata,
-            baseDir: existingMeta.baseDir,
-            ...(existingMeta.importedFrom === 'folder'
-              ? { importedFrom: 'folder' }
-              : {}),
-          };
-        } else if ('baseDir' in patch.metadata) {
-          // Non-imported project trying to acquire a baseDir → reject (only
-          // /api/import/folder can set it).
-          return sendApiError(
-            res, 400, 'BAD_REQUEST',
-            'baseDir can only be set via POST /api/import/folder',
-          );
-        }
-      }
-      if (patch.metadata?.linkedDirs) {
-        const validated = validateLinkedDirs(patch.metadata.linkedDirs);
-        if (validated.error) {
-          return sendApiError(res, 400, 'INVALID_LINKED_DIR', validated.error);
-        }
-        patch.metadata.linkedDirs = validated.dirs;
-      }
-      const project = updateProject(db, req.params.id, patch);
-      if (!project)
-        return sendApiError(res, 404, 'PROJECT_NOT_FOUND', 'not found');
-      /** @type {import('@open-design/contracts').ProjectResponse} */
-      const body = { project };
-      res.json(body);
-    } catch (err) {
-      sendApiError(res, 400, 'BAD_REQUEST', String(err));
-    }
+  registerMediaRoutes(app, {
+    db,
+    http: httpDeps,
+    paths: pathDeps,
+    ids: idDeps,
+    media: mediaDeps,
+    appConfig: appConfigDeps,
+    orbit: orbitDeps,
+    nativeDialogs: nativeDialogDeps,
+    projectStore: projectStoreDeps,
+    projectFiles: projectFileDeps,
+    conversations: conversationDeps,
+    research: researchDeps,
   });
 
   app.delete('/api/projects/:id', async (req, res) => {
@@ -2940,31 +4426,6 @@ export async function startServer({
     });
     // Bump the parent project's updatedAt so the project list re-orders.
     updateProject(db, req.params.id, {});
-    // Forward to Langfuse only on the explicit final message write. The web
-    // stream can persist a terminal runStatus before onDone has flushed the
-    // final assistant content and produced-file manifest; telemetryFinalized
-    // marks the later PUT that is safe for the bridge's SQLite read.
-    if (
-      shouldReportRunCompletedFromMessage(saved, m) &&
-      !reportedRuns.has(saved.runId)
-    ) {
-      const run = design.runs.get(saved.runId);
-      if (run) {
-        reportedRuns.add(saved.runId);
-        // Auto-evict so the Set doesn't accumulate forever in long-running
-        // daemons. Same TTL as the runs map cleanup in runs.ts.
-        setTimeout(() => reportedRuns.delete(saved.runId), 30 * 60 * 1000).unref?.();
-        void reportRunCompletedFromDaemon({
-          db,
-          dataDir: RUNTIME_DATA_DIR,
-          run,
-          persistedRunStatus: saved.runStatus,
-          persistedEndedAt:
-            typeof saved.endedAt === 'number' ? saved.endedAt : undefined,
-          appVersion: cachedAppVersion,
-        });
-      }
-    }
     res.json({ message: saved });
   });
 
@@ -3264,14 +4725,1709 @@ export async function startServer({
     }
   });
 
+  app.post('/api/design-systems', async (req, res) => {
+    try {
+      const created = await createUserDesignSystem(USER_DESIGN_SYSTEMS_DIR, req.body || {});
+      res.status(201).json({ ...created, designSystem: created });
+    } catch (err) {
+      res.status(400).json({ error: String(err) });
+    }
+  });
+
+  app.post('/api/design-systems/generation-jobs', async (req, res) => {
+    try {
+      const job = designSystemGenerationJobs.start(req.body || {});
+      res.status(202).json({ job });
+    } catch (err) {
+      res.status(400).json({ error: String(err) });
+    }
+  });
+
+  app.get('/api/design-systems/generation-jobs/:jobId', async (req, res) => {
+    try {
+      const job = designSystemGenerationJobs.get(req.params.jobId);
+      if (!job) {
+        return res.status(404).json({ error: 'design system generation job not found' });
+      }
+      res.json({ job });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.post('/api/design-systems/:id/revision-jobs', async (req, res) => {
+    try {
+      const feedback = typeof req.body?.feedback === 'string' ? req.body.feedback : '';
+      if (!feedback.trim()) return res.status(400).json({ error: 'feedback is required' });
+      const job = designSystemGenerationJobs.revise({
+        designSystemId: req.params.id,
+        feedback,
+        sectionTitle: typeof req.body?.sectionTitle === 'string' ? req.body.sectionTitle : undefined,
+        body: typeof req.body?.body === 'string' ? req.body.body : undefined,
+      });
+      res.status(202).json({ job });
+    } catch (err) {
+      res.status(400).json({ error: String(err) });
+    }
+  });
+
+  app.get('/api/design-systems/:id/revisions', async (req, res) => {
+    try {
+      const revisions = await listUserDesignSystemRevisions(
+        USER_DESIGN_SYSTEMS_DIR,
+        req.params.id,
+      );
+      if (!revisions) {
+        return res.status(404).json({ error: 'editable design system not found' });
+      }
+      res.json({ revisions });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.patch('/api/design-systems/:id/revisions/:revisionId', async (req, res) => {
+    try {
+      const status = typeof req.body?.status === 'string' ? req.body.status : '';
+      if (status !== 'accepted' && status !== 'rejected') {
+        return res.status(400).json({ error: 'status must be accepted or rejected' });
+      }
+      const revision = await updateUserDesignSystemRevisionStatus(
+        USER_DESIGN_SYSTEMS_DIR,
+        req.params.id,
+        req.params.revisionId,
+        status,
+      );
+      if (!revision) {
+        return res.status(404).json({ error: 'design system revision not found' });
+      }
+      res.json({ revision });
+    } catch (err) {
+      res.status(400).json({ error: String(err) });
+    }
+  });
+
   app.get('/api/design-systems/:id', async (req, res) => {
     try {
-      const body =
-        (await readDesignSystem(DESIGN_SYSTEMS_DIR, req.params.id)) ??
-        (await readDesignSystem(USER_DESIGN_SYSTEMS_DIR, req.params.id));
-      if (body === null)
+      const systems = await listAllDesignSystems();
+      const summary = systems.find((s) => s.id === req.params.id);
+      const projectBody = await readDesignSystemWorkspaceTextFile(db, summary, 'DESIGN.md');
+      const body = projectBody ?? await readAvailableDesignSystem(req.params.id);
+      if (body === null || !summary)
         return res.status(404).json({ error: 'design system not found' });
-      res.json({ id: req.params.id, body });
+      const packageInfo = await readAvailableDesignSystemPackageInfo(req.params.id);
+      const detail = { ...summary, body, ...(packageInfo ? { packageInfo } : {}) };
+      res.json({ ...detail, designSystem: detail });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.post('/api/design-systems/:id/workspace', async (req, res) => {
+    try {
+      const workspace = await ensureUserDesignSystemWorkspaceProject(db, req.params.id);
+      if (!workspace) {
+        return res.status(404).json({ error: 'editable design system not found' });
+      }
+      res.status(201).json(workspace);
+    } catch (err) {
+      res.status(400).json({ error: String(err) });
+    }
+  });
+
+  app.get('/api/design-systems/:id/files', async (req, res) => {
+    try {
+      const files = await listUserDesignSystemFiles(USER_DESIGN_SYSTEMS_DIR, req.params.id);
+      if (!files) {
+        return res.status(404).json({ error: 'editable design system not found' });
+      }
+      res.json({ files });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.get('/api/design-systems/:id/file', async (req, res) => {
+    try {
+      const requestedPath = typeof req.query.path === 'string' ? req.query.path : '';
+      const file = await readUserDesignSystemFile(
+        USER_DESIGN_SYSTEMS_DIR,
+        req.params.id,
+        requestedPath,
+      );
+      if (!file) return res.status(404).json({ error: 'design system file not found' });
+      res.json({ file });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.patch('/api/design-systems/:id', async (req, res) => {
+    try {
+      const updated = await updateUserDesignSystem(
+        USER_DESIGN_SYSTEMS_DIR,
+        req.params.id,
+        req.body || {},
+      );
+      if (!updated) {
+        return res.status(404).json({ error: 'editable design system not found' });
+      }
+      res.json({ ...updated, designSystem: updated });
+    } catch (err) {
+      res.status(400).json({ error: String(err) });
+    }
+  });
+
+  app.delete('/api/design-systems/:id', async (req, res) => {
+    try {
+      const ok = await deleteUserDesignSystem(USER_DESIGN_SYSTEMS_DIR, req.params.id);
+      if (!ok) {
+        return res.status(404).json({ error: 'editable design system not found' });
+      }
+      res.status(204).end();
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  // Plugin-system HTTP surface. Spec §11.5. Phase 1 wires the minimum set
+  // needed for the §12.5 walkthrough: list/get installed plugins, install
+  // (SSE), uninstall, apply (returns ApplyResult + snapshotId), atom catalog,
+  // and snapshot fetch by id (used by run replay tooling).
+  app.get('/api/plugins', async (_req, res) => {
+    try {
+      const plugins = listInstalledPlugins(db);
+      res.json({ plugins });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.get('/api/plugins/:id', async (req, res) => {
+    try {
+      const plugin = getInstalledPlugin(db, req.params.id);
+      if (!plugin) return res.status(404).json({ error: 'plugin not found' });
+      res.json(plugin);
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  async function finishUploadedPluginInstall(stagedFolder, source) {
+    const warnings = [];
+    const log = [];
+    let plugin = null;
+    let message = 'Install finished.';
+    try {
+      const pluginRoot = await findUploadedPluginRoot(stagedFolder);
+      for await (const ev of installFromLocalFolder(db, {
+        source,
+        roots: PLUGIN_REGISTRY_ROOTS,
+        _stagedFolder: pluginRoot,
+        _stagedSourceKind: 'user',
+        lockfilePath: PLUGIN_LOCKFILE_PATH,
+      })) {
+        if (ev.message) log.push(ev.message);
+        if (Array.isArray(ev.warnings)) warnings.splice(0, warnings.length, ...ev.warnings);
+        if (ev.kind === 'success') {
+          plugin = ev.plugin;
+          message = `Installed ${ev.plugin.title}.`;
+          break;
+        }
+        if (ev.kind === 'error') {
+          message = ev.message;
+          break;
+        }
+      }
+      return { ok: Boolean(plugin), plugin, warnings, message, log };
+    } finally {
+      await fs.promises.rm(stagedFolder, { recursive: true, force: true }).catch(() => undefined);
+    }
+  }
+
+  async function findUploadedPluginRoot(stagedFolder) {
+    if (await folderLooksLikePlugin(stagedFolder)) return stagedFolder;
+    const entries = await fs.promises.readdir(stagedFolder, { withFileTypes: true });
+    const dirs = entries.filter((entry) => entry.isDirectory());
+    const files = entries.filter((entry) => entry.isFile());
+    if (files.length === 0 && dirs.length === 1) {
+      const nested = path.join(stagedFolder, dirs[0].name);
+      if (await folderLooksLikePlugin(nested)) return nested;
+    }
+    return stagedFolder;
+  }
+
+  async function folderLooksLikePlugin(folder) {
+    const names = ['open-design.json', 'SKILL.md', path.join('.claude-plugin', 'plugin.json')];
+    for (const name of names) {
+      if (fs.existsSync(path.join(folder, name))) return true;
+    }
+    return false;
+  }
+
+  function safeUploadRelativePath(input) {
+    const value = String(input || '').replace(/\\/g, '/');
+    if (!value || value.includes('\0') || value.startsWith('/') || /^[A-Za-z]:\//.test(value)) {
+      throw new Error('invalid upload path');
+    }
+    const parts = value.split('/').filter(Boolean);
+    if (parts.length === 0 || parts.some((part) => part === '.' || part === '..')) {
+      throw new Error(`unsafe upload path: ${value}`);
+    }
+    return parts.join(path.sep);
+  }
+
+  async function extractPluginZipToFolder(buffer, stagedFolder) {
+    if (buffer.length > PLUGIN_UPLOAD_MAX_BYTES) {
+      throw new Error('zip file too large');
+    }
+    const zip = await JSZip.loadAsync(buffer);
+    let totalBytes = 0;
+    const entries = Object.values(zip.files);
+    if (entries.length === 0) throw new Error('zip contains no files');
+    for (const entry of entries) {
+      if (entry.dir) continue;
+      const rel = safeUploadRelativePath(entry.name);
+      const unixMode = typeof entry.unixPermissions === 'number' ? entry.unixPermissions : 0;
+      if ((unixMode & 0o170000) === 0o120000) {
+        throw new Error(`zip entry is a symbolic link: ${entry.name}`);
+      }
+      const content = await entry.async('nodebuffer');
+      totalBytes += content.length;
+      if (totalBytes > PLUGIN_UPLOAD_MAX_BYTES) {
+        throw new Error('zip extracted size exceeds 50 MiB');
+      }
+      const dest = path.join(stagedFolder, rel);
+      await fs.promises.mkdir(path.dirname(dest), { recursive: true });
+      await fs.promises.writeFile(dest, content);
+    }
+  }
+
+  app.post('/api/plugins/upload-zip', (req, res) => {
+    pluginUpload.single('file')(req, res, async (err) => {
+      if (err) return sendMulterError(res, err);
+      try {
+        const file = req.file;
+        if (!file || !file.buffer) {
+          return res.status(400).json({ error: 'file is required' });
+        }
+        const stagedFolder = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'od-plugin-zip-'));
+        await extractPluginZipToFolder(file.buffer, stagedFolder);
+        const result = await finishUploadedPluginInstall(
+          stagedFolder,
+          `upload:zip:${decodeMultipartFilename(file.originalname || 'plugin.zip')}`,
+        );
+        res.status(result.ok ? 200 : 400).json(result);
+      } catch (uploadErr) {
+        res.status(400).json({
+          ok: false,
+          warnings: [],
+          message: String(uploadErr?.message || uploadErr),
+          log: [],
+        });
+      }
+    });
+  });
+
+  app.post('/api/plugins/upload-folder', (req, res) => {
+    pluginUpload.array('files', 500)(req, res, async (err) => {
+      if (err) return sendMulterError(res, err);
+      const stagedFolder = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'od-plugin-folder-'));
+      try {
+        const files = Array.isArray(req.files) ? req.files : [];
+        if (files.length === 0) {
+          await fs.promises.rm(stagedFolder, { recursive: true, force: true }).catch(() => undefined);
+          return res.status(400).json({ error: 'files are required' });
+        }
+        const rawPaths = req.body?.paths;
+        const paths = Array.isArray(rawPaths) ? rawPaths : rawPaths ? [rawPaths] : [];
+        let totalBytes = 0;
+        for (let i = 0; i < files.length; i += 1) {
+          const file = files[i];
+          totalBytes += file.buffer.length;
+          if (totalBytes > PLUGIN_UPLOAD_MAX_BYTES) {
+            throw new Error('folder upload exceeds 50 MiB');
+          }
+          const rel = safeUploadRelativePath(paths[i] || file.originalname);
+          const dest = path.join(stagedFolder, rel);
+          await fs.promises.mkdir(path.dirname(dest), { recursive: true });
+          await fs.promises.writeFile(dest, file.buffer);
+        }
+        const result = await finishUploadedPluginInstall(stagedFolder, 'upload:folder');
+        res.status(result.ok ? 200 : 400).json(result);
+      } catch (uploadErr) {
+        await fs.promises.rm(stagedFolder, { recursive: true, force: true }).catch(() => undefined);
+        res.status(400).json({
+          ok: false,
+          warnings: [],
+          message: String(uploadErr?.message || uploadErr),
+          log: [],
+        });
+      }
+    });
+  });
+
+  app.post('/api/plugins/install', async (req, res) => {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    let source = typeof body.source === 'string' ? body.source : '';
+    let marketplaceResolution: {
+      marketplaceId: string;
+      marketplaceTrust: 'official' | 'trusted' | 'restricted';
+      pluginName: string;
+      pluginVersion: string;
+      source: string;
+      ref?: string;
+      manifestDigest?: string;
+      archiveIntegrity?: string;
+    } | null = null;
+    if (!source) {
+      return res.status(400).json({ error: 'source is required' });
+    }
+    // Plan §3.A6: accept local folder, github:owner/repo[@ref][/subpath],
+    // and https://*.tar.gz / *.tgz sources. Plan §3.F3: also accept a
+    // bare plugin name and resolve it through the configured marketplaces.
+    // Other shapes are 400 so the error surface is clear.
+    const looksAbsolute = source.startsWith('/') || source.startsWith('./') || source.startsWith('~');
+    const looksGithub = source.startsWith('github:');
+    const looksHttps = /^https:\/\//i.test(source);
+    if (!looksAbsolute && !looksGithub && !looksHttps) {
+      // Treat the source as a plugin name and look it up in the
+      // marketplace registry. Match resolution returns the canonical
+      // source (github:… / https://…) so the installer can replay
+      // the same byte path that would happen if the user copy-pasted
+      // the source manually.
+      const { resolvePluginInMarketplaces } = await import('./plugins/marketplaces.js');
+      let lookupName = source;
+      const lockfile = await readPluginLockfile(PLUGIN_LOCKFILE_PATH);
+      const locked = lockfile.plugins[source];
+      if (locked?.version && !source.includes('@')) {
+        lookupName = `${source}@${locked.version}`;
+      }
+      const resolved = resolvePluginInMarketplaces(db, lookupName);
+      if (!resolved) {
+        return res.status(404).json({
+          error: {
+            code: 'plugin-not-found',
+            message: `No marketplace plugin named "${source}". Add a marketplace via 'od marketplace add <url>' or pass a github: / https:// / local source.`,
+            data: { name: source },
+          },
+        });
+      }
+      marketplaceResolution = resolved;
+      source = resolved.source;
+    }
+
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders?.();
+
+    const writeEvent = (event: string, data: unknown) => {
+      res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+    };
+
+    try {
+      for await (const ev of installPlugin(db, {
+        source,
+        roots: PLUGIN_REGISTRY_ROOTS,
+        sourceMarketplaceId: marketplaceResolution?.marketplaceId,
+        sourceMarketplaceEntryName: marketplaceResolution?.pluginName,
+        sourceMarketplaceEntryVersion: marketplaceResolution?.pluginVersion,
+        marketplaceTrust: marketplaceResolution?.marketplaceTrust,
+        resolvedSource: marketplaceResolution?.source,
+        resolvedRef: marketplaceResolution?.ref,
+        manifestDigest: marketplaceResolution?.manifestDigest,
+        archiveIntegrity: marketplaceResolution?.archiveIntegrity,
+        lockfilePath: PLUGIN_LOCKFILE_PATH,
+      })) {
+        writeEvent(ev.kind, ev);
+        if (ev.kind === 'success' || ev.kind === 'error') break;
+      }
+    } catch (err) {
+      writeEvent('error', { kind: 'error', message: String(err), warnings: [] });
+    } finally {
+      res.end();
+    }
+  });
+
+  app.post('/api/plugins/:id/uninstall', async (req, res) => {
+    try {
+      const result = await uninstallPlugin(db, req.params.id, PLUGIN_REGISTRY_ROOTS);
+      if (!result.ok && !result.removedFolder) {
+        return res.status(404).json({ error: 'plugin not found', warning: result.warning });
+      }
+      res.json(result);
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  // Plan §3.Z2 — `od plugin upgrade <id>` re-installs a plugin from
+  // its recorded source. Streams the same SSE shape as
+  // POST /api/plugins/install so CLIs and the web composer reuse
+  // the existing event handler.
+  //
+  // Rejected for source_kind='bundled': bundled plugins are
+  // shipped with the daemon image and the bundled boot walker
+  // re-registers them on every boot. Letting an operator
+  // 'upgrade' a bundled plugin would silently overwrite the
+  // daemon's authoritative copy and confuse the next boot.
+  app.post('/api/plugins/:id/upgrade', async (req, res) => {
+    const id = req.params.id;
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const policy = body.policy === 'pinned' ? 'pinned' : 'latest';
+    const plugin = getInstalledPlugin(db, id);
+    if (!plugin) {
+      return res.status(404).json({
+        error: { code: 'plugin-not-found', message: `No installed plugin with id "${id}".`, data: { id } },
+      });
+    }
+    if (plugin.sourceKind === 'bundled') {
+      return res.status(409).json({
+        error: {
+          code: 'bundled-plugin',
+          message: `Plugin "${id}" was shipped bundled with the daemon and upgrades only via daemon-image upgrade. The bundled boot walker re-registers bundled plugins on every boot.`,
+          data: { id, sourceKind: plugin.sourceKind },
+        },
+      });
+    }
+    let source = plugin.source;
+    let marketplaceResolution: {
+      marketplaceId: string;
+      marketplaceTrust: 'official' | 'trusted' | 'restricted';
+      pluginName: string;
+      pluginVersion: string;
+      source: string;
+      ref?: string;
+      manifestDigest?: string;
+      archiveIntegrity?: string;
+    } | null = null;
+    if (policy === 'latest' && plugin.sourceMarketplaceEntryName) {
+      const { resolvePluginInMarketplaces } = await import('./plugins/marketplaces.js');
+      marketplaceResolution = resolvePluginInMarketplaces(db, plugin.sourceMarketplaceEntryName);
+      if (marketplaceResolution) {
+        source = marketplaceResolution.source;
+      }
+    }
+    if (!source) {
+      return res.status(409).json({
+        error: {
+          code: 'missing-source',
+          message: `Plugin "${id}" has no recorded install source — cannot upgrade. Reinstall via 'od plugin install --source <...>' to set one.`,
+          data: { id },
+        },
+      });
+    }
+
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders?.();
+
+    const writeEvent = (event: string, data: unknown) => {
+      res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+    };
+
+    writeEvent('progress', { kind: 'progress', phase: 'resolving', message: `Upgrading ${id} from ${source} (policy=${policy})` });
+
+    try {
+      for await (const ev of installPlugin(db, {
+        source,
+        roots: PLUGIN_REGISTRY_ROOTS,
+        eventKind: 'upgraded',
+        sourceMarketplaceId: marketplaceResolution?.marketplaceId ?? plugin.sourceMarketplaceId,
+        sourceMarketplaceEntryName: marketplaceResolution?.pluginName ?? plugin.sourceMarketplaceEntryName,
+        sourceMarketplaceEntryVersion: marketplaceResolution?.pluginVersion ?? plugin.sourceMarketplaceEntryVersion,
+        marketplaceTrust: marketplaceResolution?.marketplaceTrust ?? plugin.marketplaceTrust,
+        resolvedSource: marketplaceResolution?.source ?? plugin.resolvedSource,
+        resolvedRef: marketplaceResolution?.ref ?? plugin.resolvedRef,
+        manifestDigest: marketplaceResolution?.manifestDigest ?? plugin.manifestDigest,
+        archiveIntegrity: marketplaceResolution?.archiveIntegrity ?? plugin.archiveIntegrity,
+        lockfilePath: PLUGIN_LOCKFILE_PATH,
+      })) {
+        writeEvent(ev.kind, ev);
+        if (ev.kind === 'success' || ev.kind === 'error') break;
+      }
+    } catch (err) {
+      writeEvent('error', { kind: 'error', message: String(err), warnings: [] });
+    } finally {
+      res.end();
+    }
+  });
+
+  // Plan §3.A1: shared helper used by every endpoint that has to resolve
+  // plugin context against the live registry. Skills + design systems are
+  // walked from disk; craft is empty in v1; atoms come from the
+  // first-party catalog. Project-scoped overrides arrive in Phase 4.
+  async function loadPluginRegistryView() {
+    const [skills, designSystems] = await Promise.all([
+      listAllSkills(),
+      listAllDesignSystems(),
+    ]);
+    // Spec §23.3.3: surface the bundled scenario plugins so apply()
+    // can fall back to the matching scenario's pipeline when the
+    // consumer plugin omits od.pipeline. Each scenario carries a
+    // `taskKind` that picks the match.
+    const scenarios = collectBundledScenarios();
+    return {
+      skills: skills.map((s) => ({ id: s.id, title: s.name, description: s.description })),
+      designSystems: designSystems.map((d) => ({ id: d.id, title: d.title })),
+      craft: [],
+      atoms: FIRST_PARTY_ATOMS.map((a) => ({ id: a.id, label: a.label })),
+      scenarios,
+    };
+  }
+
+  // Pure read off `installed_plugins`: rows whose source_kind='bundled'
+  // AND od.kind='scenario' AND od.pipeline is non-empty become entries
+  // the apply path can fall back to. Scenario plugins from third-party
+  // sources are intentionally NOT trusted as defaults — the bundled
+  // boot walker (apps/daemon/src/plugins/bundled.ts) is the only writer
+  // of source_kind='bundled', so this function never grants the
+  // privilege to user-installed scenarios.
+  //
+  // Plan §3.O1 / §C-stage of plugin-driven-flow-plan: more than one
+  // bundled scenario may share a `taskKind` (e.g. `od-media-generation`
+  // also claims `new-generation` so the kind → scenario map can route
+  // image / video / audio projects to it). The pipeline-fallback
+  // resolver expects ONE scenario per taskKind, so this function
+  // dedupes and prefers the canonical id `od-<taskKind>` as the
+  // pipeline-fallback winner. Non-canonical scenarios still install
+  // and run through their explicit pluginId path; they just don't get
+  // to hijack a consumer plugin that omitted `od.pipeline`.
+  function collectBundledScenarios() {
+    type ScenarioEntry = {
+      id: string;
+      taskKind: 'new-generation' | 'figma-migration' | 'code-migration' | 'tune-collab';
+      pipeline: NonNullable<NonNullable<import('@open-design/contracts').PluginManifest['od']>['pipeline']>;
+    };
+    const byTaskKind = new Map<ScenarioEntry['taskKind'], ScenarioEntry>();
+    try {
+      const all = listInstalledPlugins(db);
+      for (const row of all) {
+        if (row.sourceKind !== 'bundled') continue;
+        const od = row.manifest.od;
+        if (!od || od.kind !== 'scenario') continue;
+        if (!od.pipeline || !Array.isArray(od.pipeline.stages) || od.pipeline.stages.length === 0) continue;
+        const taskKind = (od.taskKind ?? 'new-generation') as ScenarioEntry['taskKind'];
+        if (taskKind !== 'new-generation' && taskKind !== 'figma-migration' &&
+            taskKind !== 'code-migration' && taskKind !== 'tune-collab') continue;
+        const entry: ScenarioEntry = { id: row.id, taskKind, pipeline: od.pipeline };
+        const existing = byTaskKind.get(taskKind);
+        if (!existing || entry.id === `od-${taskKind}`) {
+          byTaskKind.set(taskKind, entry);
+        }
+      }
+    } catch {
+      // On a fresh install the table may not exist yet; surface no
+      // scenarios rather than crash the apply path.
+      return [];
+    }
+    return Array.from(byTaskKind.values());
+  }
+
+  app.post('/api/plugins/:id/apply', async (req, res) => {
+    try {
+      const plugin = getInstalledPlugin(db, req.params.id);
+      if (!plugin) return res.status(404).json({ error: 'plugin not found' });
+      const body = req.body && typeof req.body === 'object' ? req.body : {};
+      const inputs = body.inputs && typeof body.inputs === 'object' ? body.inputs : {};
+      const grantCaps = Array.isArray(body.grantCaps)
+        ? body.grantCaps.filter((c) => typeof c === 'string')
+        : [];
+      const locale = typeof body.locale === 'string' ? body.locale : undefined;
+
+      const registry = await loadPluginRegistryView();
+      const computed = applyPlugin({ plugin, inputs, registry, locale });
+      // Plan §3.B2 — apply-time grants are merged into the snapshot's
+      // capabilitiesGranted so the §9 capability gate sees them, but
+      // they are NOT written back to installed_plugins.capabilities_granted.
+      // The snapshot is the only place this ephemeral grant lives.
+      if (grantCaps.length > 0) {
+        const merged = new Set([...computed.result.capabilitiesGranted, ...grantCaps]);
+        computed.result.capabilitiesGranted = Array.from(merged);
+        computed.result.appliedPlugin.capabilitiesGranted = Array.from(merged);
+      }
+      res.json({ ok: true, ...computed.result, warnings: computed.warnings, manifestSourceDigest: computed.manifestSourceDigest });
+    } catch (err) {
+      if (err instanceof MissingInputError) {
+        return res.status(422).json({ error: 'missing_inputs', fields: err.fields });
+      }
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.post('/api/plugins/:id/share-project', async (req, res) => {
+    try {
+      const sourcePlugin = getInstalledPlugin(db, req.params.id);
+      if (!sourcePlugin) {
+        sendApiError(res, 404, 'NOT_FOUND', 'plugin not found');
+        return;
+      }
+      if (!USER_PLUGIN_SOURCE_KINDS.has(sourcePlugin.sourceKind)) {
+        res.status(409).json({
+          ok: false,
+          code: 'plugin-not-shareable',
+          message: 'Only user-installed plugins can start a share project.',
+        });
+        return;
+      }
+
+      const body = req.body && typeof req.body === 'object' ? req.body : {};
+      const action = normalizePluginShareAction(body.action);
+      if (!action) {
+        sendApiError(res, 400, 'BAD_REQUEST', 'action must be publish-github or contribute-open-design');
+        return;
+      }
+      const actionPluginId = PLUGIN_SHARE_ACTION_PLUGIN_IDS[action];
+      const actionPlugin = getInstalledPlugin(db, actionPluginId);
+      if (!actionPlugin) {
+        res.status(409).json({
+          ok: false,
+          code: 'share-action-plugin-missing',
+          message: `The bundled action plugin "${actionPluginId}" is not installed. Restart the daemon so bundled plugins are registered.`,
+        });
+        return;
+      }
+
+      const now = Date.now();
+      const id = randomId();
+      const cid = randomId();
+      const sourceSlug = githubRepoNameFromPluginName(sourcePlugin.id);
+      const stagedPath = `plugin-source/${sourceSlug}`;
+      const prompt = renderPluginSharePrompt({ action, sourcePlugin, stagedPath });
+      const metadata = { kind: 'prototype' };
+      const projectRoot = await ensureProject(PROJECTS_DIR, id, metadata);
+      await copyPluginFolderForProjectContext(
+        sourcePlugin.fsPath,
+        path.join(projectRoot, 'plugin-source', sourceSlug),
+      );
+
+      insertProject(db, {
+        id,
+        name: `${PLUGIN_SHARE_ACTION_LABELS[action]}: ${sourcePlugin.title || sourcePlugin.id}`,
+        skillId: null,
+        designSystemId: null,
+        pendingPrompt: prompt,
+        metadata,
+        createdAt: now,
+        updatedAt: now,
+      });
+      insertConversation(db, {
+        id: cid,
+        projectId: id,
+        title: null,
+        createdAt: now,
+        updatedAt: now,
+      });
+
+      const registry = await loadPluginRegistryView();
+      const resolved = resolvePluginSnapshot({
+        db,
+        body: {
+          pluginId: actionPluginId,
+          pluginInputs: {
+            source_plugin_id: sourcePlugin.id,
+            source_plugin_title: sourcePlugin.title || sourcePlugin.id,
+            source_plugin_version: sourcePlugin.version,
+            source_plugin_path: sourcePlugin.fsPath,
+            plugin_context_path: stagedPath,
+          },
+          locale: typeof body.locale === 'string' ? body.locale : undefined,
+        },
+        projectId: id,
+        conversationId: cid,
+        registry,
+      });
+      if (resolved && !resolved.ok) {
+        res.status(resolved.status).json(resolved.body);
+        return;
+      }
+
+      const project = getProject(db, id);
+      if (!project) {
+        sendApiError(res, 500, 'INTERNAL_ERROR', 'created project could not be loaded');
+        return;
+      }
+      res.json({
+        ok: true,
+        project,
+        conversationId: cid,
+        ...(resolved?.ok ? { appliedPluginSnapshotId: resolved.snapshotId } : {}),
+        actionPluginId,
+        sourcePluginId: sourcePlugin.id,
+        stagedPath,
+        prompt,
+        message: `Created a ${PLUGIN_SHARE_ACTION_LABELS[action]} task for ${sourcePlugin.title || sourcePlugin.id}.`,
+      });
+    } catch (err) {
+      res.status(400).json({ ok: false, message: String(err?.message || err) });
+    }
+  });
+
+  app.post('/api/plugins/:id/doctor', async (req, res) => {
+    try {
+      const plugin = getInstalledPlugin(db, req.params.id);
+      if (!plugin) return res.status(404).json({ error: 'plugin not found' });
+      const registry = await loadPluginRegistryView();
+      const report = doctorPlugin(plugin, registry);
+      res.json(report);
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  // Plan §3.A2 / spec §9.1: persistent capability grant. Body is
+  // `{ capabilities: string[], action?: 'grant' | 'revoke' }`. The daemon
+  // validates each entry against the §5.3 vocabulary; unknown / malformed
+  // strings come back as 400 with the offending list so the CLI can
+  // render exit-code-2 usage advice. The mutation goes through
+  // `grantCapabilities` / `revokeCapabilities` (the only writers of
+  // `installed_plugins.capabilities_granted` outside of install).
+  app.post('/api/plugins/:id/trust', async (req, res) => {
+    try {
+      const plugin = getInstalledPlugin(db, req.params.id);
+      if (!plugin) return res.status(404).json({ error: 'plugin not found' });
+      const body = req.body && typeof req.body === 'object' ? req.body : {};
+      const action = body.action === 'revoke' ? 'revoke' : 'grant';
+      const { validateCapabilityList, grantCapabilities, revokeCapabilities } =
+        await import('./plugins/trust.js');
+      const { accepted, rejected } = validateCapabilityList(body.capabilities);
+      if (rejected.length > 0) {
+        return res.status(400).json({
+          error: {
+            code: 'invalid-capability',
+            message: `Capability validation failed: ${rejected.map((r) => r.capability).join(', ')}`,
+            data: { rejected },
+          },
+        });
+      }
+      if (accepted.length === 0) {
+        return res.status(400).json({
+          error: {
+            code: 'no-capabilities',
+            message: 'capabilities[] is required and must contain at least one entry',
+          },
+        });
+      }
+      const next = action === 'revoke'
+        ? revokeCapabilities({ db, pluginId: req.params.id, capabilities: accepted })
+        : grantCapabilities({ db, pluginId: req.params.id, capabilities: accepted });
+      const updated = getInstalledPlugin(db, req.params.id);
+      // Plan §3.JJ1 — emit a 'plugin.trust-changed' event so the
+      // ops live-tail surfaces capability mutations for security
+      // audit. Best-effort.
+      try {
+        const { recordPluginEvent } = await import('./plugins/events.js');
+        recordPluginEvent({
+          kind:     'plugin.trust-changed',
+          pluginId: req.params.id,
+          details:  { action, capabilities: accepted, total: next.length },
+        });
+      } catch {
+        // ignore — event recording never blocks the trust mutation.
+      }
+      res.status(action === 'grant' ? 201 : 200).json({
+        ok: true,
+        id: req.params.id,
+        action,
+        capabilitiesGranted: next,
+        plugin: updated,
+      });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.get('/api/atoms', (_req, res) => {
+    res.json({ atoms: FIRST_PARTY_ATOMS.map((a) => ({ ...a, taskKinds: a.taskKinds.slice() })) });
+  });
+
+  // Plan §3.AA2 — `od atoms info <id>`. Returns the catalog row +
+  // the bundled SKILL.md body (when one exists at
+  // plugins/_official/atoms/<id>/SKILL.md) so the caller can render
+  // a single page describing what the atom does + the prompt
+  // fragment that drives it.
+  app.get('/api/atoms/:id', async (req, res) => {
+    const id = req.params.id;
+    const atom = FIRST_PARTY_ATOMS.find((a) => a.id === id);
+    if (!atom) return res.status(404).json({ error: { code: 'atom-not-found', message: `Unknown atom "${id}"` } });
+    const body: Record<string, unknown> = {
+      ...atom,
+      taskKinds: atom.taskKinds.slice(),
+    };
+    try {
+      const { loadAtomBodies } = await import('./plugins/atom-bodies.js');
+      const bodies = await loadAtomBodies(db, [id]);
+      if (bodies[0] && typeof bodies[0].body === 'string') {
+        body.skillBody = bodies[0].body;
+      }
+    } catch (err) {
+      // Best-effort; atom info still useful without the body.
+      console.warn(`[atoms] failed to load SKILL.md body for ${id}:`, err);
+    }
+    res.json(body);
+  });
+
+  // Plan §3.L3 / spec §10.3.5 / §9.2 — plugin asset endpoint.
+  //
+  // Serves a static file from inside an installed plugin's fsPath,
+  // sandboxed by:
+  //   - whitelisted plugin ids (the registry row),
+  //   - normalized relpath (no '..' / absolute / leading drive),
+  //   - the §9.2 preview CSP (default-src 'none'; script-src 'self'
+  //     'unsafe-inline'; connect-src 'none'; frame-ancestors 'self'),
+  //   - X-Content-Type-Options: nosniff so the browser respects the
+  //     declared content type even on miss.
+  // The web GenUISurfaceRenderer's SandboxedComponentSurface points
+  // its iframe at this URL.
+  // Helper for the /preview + /example/:name routes below. Walks a
+  // list of candidate relpaths inside the plugin folder, picks the
+  // first one that exists + stays inside the fsPath, and serves it
+  // with the §9.2 sandboxed-iframe CSP (same shape as `/asset/*`).
+  // Pulled out so /preview and /example/:name share a single source
+  // of truth for the security envelope.
+  async function servePluginSandboxedHtml(
+    req: any,
+    res: any,
+    pickCandidates: (plugin: any) => Promise<string[]> | string[],
+  ): Promise<void> {
+    try {
+      const plugin = getInstalledPlugin(db, req.params.id);
+      if (!plugin) {
+        res.status(404).json({ error: 'plugin not found' });
+        return;
+      }
+      const candidates = (await pickCandidates(plugin)).filter(
+        (p): p is string => typeof p === 'string' && p.length > 0,
+      );
+      const path = await import('node:path');
+      const fsp = await import('node:fs/promises');
+      const root = path.resolve(plugin.fsPath) + path.sep;
+      let resolved: string | null = null;
+      let resolvedRel: string | null = null;
+      for (const rel of candidates) {
+        if (rel.includes('..') || rel.startsWith('/') || rel.includes('\0')) continue;
+        const full = path.resolve(plugin.fsPath, rel);
+        if (!(full + path.sep).startsWith(root) && full !== path.resolve(plugin.fsPath)) continue;
+        try {
+          const st = await fsp.stat(full);
+          // Refuse symlinks — the install root may be writable so a
+          // symlink leak would defeat the containment check above.
+          const lst = await fsp.lstat(full);
+          if (lst.isSymbolicLink()) continue;
+          if (!st.isFile()) continue;
+          // 5 MiB cap — preview HTML is human-authored; refuse anything
+          // resembling a binary blob smuggled through this surface.
+          if (st.size > 5 * 1024 * 1024) {
+            res.status(413).json({ error: 'preview asset too large' });
+            return;
+          }
+          resolved = full;
+          resolvedRel = rel;
+          break;
+        } catch {
+          // try next candidate
+        }
+      }
+      if (!resolved) {
+        res.status(404).json({ error: 'preview not found' });
+        return;
+      }
+      let contentPath = resolved;
+      let buf = await fsp.readFile(resolved);
+      if (resolvedRel && /(^|\/)example-slides\.html$/i.test(resolvedRel)) {
+        const templateRel = resolvedRel.replace(
+          /(^|\/)example-slides\.html$/i,
+          '$1template.html',
+        );
+        const templateFull = path.resolve(plugin.fsPath, templateRel);
+        const templateInside =
+          (templateFull + path.sep).startsWith(root) ||
+          templateFull === path.resolve(plugin.fsPath);
+        if (templateInside) {
+          try {
+            const st = await fsp.stat(templateFull);
+            const lst = await fsp.lstat(templateFull);
+            if (!lst.isSymbolicLink() && st.isFile() && st.size <= 5 * 1024 * 1024) {
+              const title =
+                typeof plugin.title === 'string'
+                  ? plugin.title
+                  : typeof plugin.manifest?.title === 'string'
+                    ? plugin.manifest.title
+                    : req.params.id;
+              const tplHtml = await fsp.readFile(templateFull, 'utf8');
+              const slidesHtml = buf.toString('utf8');
+              buf = Buffer.from(assembleExample(tplHtml, slidesHtml, title), 'utf8');
+              contentPath = templateFull;
+            }
+          } catch {
+            // Keep the raw fallback if the companion template is missing.
+          }
+        }
+      }
+      res.setHeader(
+        'Content-Security-Policy',
+        "default-src 'none'; img-src 'self' data: blob:; media-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'none'; frame-ancestors 'self'",
+      );
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+      const ext = path.extname(contentPath).toLowerCase();
+      const ct =
+        ext === '.html' ? 'text/html; charset=utf-8'
+        : ext === '.js'  ? 'application/javascript; charset=utf-8'
+        : ext === '.css' ? 'text/css; charset=utf-8'
+        : ext === '.json' ? 'application/json; charset=utf-8'
+        : ext === '.svg' ? 'image/svg+xml'
+        : ext === '.png' ? 'image/png'
+        : ext === '.jpg' || ext === '.jpeg' ? 'image/jpeg'
+        : 'application/octet-stream';
+      res.setHeader('Content-Type', ct);
+      res.send(buf);
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  }
+
+  // Plan §6 Phase 2B + spec §11.6 / §9.2 — plugin preview + examples.
+  //
+  // Two flavours wrap the same sandboxed-HTML envelope as `/asset/*`:
+  //   - `/preview` serves the plugin's preview entry (declared via
+  //     `od.preview.entry`, with fallbacks that walk the plugin's
+  //     own context.assets[] HTMLs, examples/*.html and assets/*.html).
+  //   - `/example/:name` serves an entry from `od.useCase.exampleOutputs[]`,
+  //     matched by basename or by index. Both reuse the same
+  //     traversal / containment guards as the asset route.
+  //
+  // The marketplace detail page (PluginDetailView) embeds /preview
+  // inside an `<iframe sandbox="allow-scripts">`. The §9.2 CSP keeps
+  // the preview from reaching back into /api/* even if its scripts
+  // try to fetch.
+  //
+  // Some bundled plugins (`example-guizang-ppt`, `example-html-ppt`,
+  // …) declare `od.preview.entry: "./index.html"` but actually ship
+  // the renderable HTML under `assets/example-slides.html` or
+  // `assets/template.html`. Returning 404 in that case lit up white
+  // tiles in the home gallery, so the candidates list always extends
+  // past the declared entry to walk a curated fallback chain.
+  //
+  // `assets/example-slides.html` is a special case: for guizang-ppt it
+  // is intentionally only the slide fragment. The old skill preview
+  // assembled it into `assets/template.html` at request time; the plugin
+  // route mirrors that so the marketplace card keeps the WebGL/e-ink
+  // magazine treatment instead of rendering unstyled fragments.
+  function collectPluginPreviewCandidates(plugin: unknown): string[] {
+    const candidates: string[] = [];
+    const seen = new Set<string>();
+    function push(rel: unknown): void {
+      if (typeof rel !== 'string') return;
+      const trimmed = rel.replace(/^\.\//, '');
+      if (!trimmed || seen.has(trimmed)) return;
+      seen.add(trimmed);
+      candidates.push(trimmed);
+    }
+
+    const manifest =
+      ((plugin as { manifest?: unknown }).manifest ?? {}) as Record<string, unknown>;
+    const od = (manifest.od ?? {}) as Record<string, unknown>;
+    const preview = (od.preview ?? {}) as Record<string, unknown>;
+
+    push(preview.entry);
+
+    const ctx = (od.context ?? {}) as Record<string, unknown>;
+    const assets = Array.isArray(ctx.assets) ? ctx.assets : [];
+    for (const a of assets) {
+      const rel = typeof a === 'string' ? a : null;
+      if (rel && /\.html?$/i.test(rel)) push(rel);
+    }
+
+    const useCase = (od.useCase ?? {}) as Record<string, unknown>;
+    const exampleOutputs = Array.isArray(useCase.exampleOutputs)
+      ? useCase.exampleOutputs
+      : [];
+    for (const ex of exampleOutputs) {
+      const p = (ex as { path?: unknown })?.path;
+      if (typeof p === 'string' && /\.html?$/i.test(p)) push(p);
+    }
+
+    push('preview/index.html');
+    push('index.html');
+    push('examples/index.html');
+    push('assets/index.html');
+    push('assets/preview.html');
+    push('assets/example.html');
+    push('assets/example-slides.html');
+    push('assets/template.html');
+    push('public/index.html');
+    push('dist/index.html');
+    return candidates;
+  }
+
+  // Last-resort discovery for plugins whose bundle ships HTML but
+  // doesn't match any of the conventional paths. We scan the plugin
+  // root and a handful of common subfolders (assets/, public/, dist/,
+  // examples/, preview/, templates/) for any `*.html` and surface
+  // the first one. The scan is shallow to avoid pathological large
+  // bundles, and the same containment guard inside
+  // servePluginSandboxedHtml validates each candidate before reading.
+  async function discoverPluginHtmlAssets(pluginFsPath: string): Promise<string[]> {
+    const path = await import('node:path');
+    const fsp = await import('node:fs/promises');
+    const dirs = ['', 'assets', 'public', 'dist', 'examples', 'preview', 'templates'];
+    const found: string[] = [];
+    for (const dir of dirs) {
+      const abs = path.resolve(pluginFsPath, dir);
+      try {
+        const entries = await fsp.readdir(abs, { withFileTypes: true });
+        for (const ent of entries) {
+          if (!ent.isFile()) continue;
+          if (!/\.html?$/i.test(ent.name)) continue;
+          found.push(dir ? `${dir}/${ent.name}` : ent.name);
+        }
+      } catch {
+        // dir missing — skip
+      }
+    }
+    return found;
+  }
+
+  app.get('/api/plugins/:id/preview', async (req, res) => {
+    await servePluginSandboxedHtml(req, res, async (plugin) => {
+      const curated = collectPluginPreviewCandidates(plugin);
+      const fsPath = (plugin as { fsPath?: unknown }).fsPath;
+      if (typeof fsPath !== 'string') return curated;
+      const discovered = await discoverPluginHtmlAssets(fsPath);
+      const seen = new Set(curated);
+      for (const rel of discovered) {
+        if (!seen.has(rel)) curated.push(rel);
+      }
+      return curated;
+    });
+  });
+
+  app.get('/api/plugins/:id/example/:name', async (req, res) => {
+    const name = String(req.params.name ?? '');
+    if (!name || /[\\/\0]|\.\./.test(name)) {
+      return res.status(400).json({ error: 'invalid example name' });
+    }
+    await servePluginSandboxedHtml(req, res, async (plugin) => {
+      const examples = ((plugin as { manifest?: { od?: { useCase?: { exampleOutputs?: Array<{ path?: unknown; title?: unknown }> } } } })
+        .manifest?.od?.useCase?.exampleOutputs ?? []) as Array<{ path?: unknown; title?: unknown }>;
+      const match = examples.find((e) => {
+        if (!e || typeof e.path !== 'string') return false;
+        const segments = e.path.split(/[\\/]/).filter(Boolean);
+        const base = segments[segments.length - 1] ?? '';
+        const baseStem = base.replace(/\.[^.]+$/, '');
+        // For `examples/<folder>/index.html` the conceptual "name"
+        // is the folder, not the inner basename.
+        const parent = segments.length >= 2 ? segments[segments.length - 2] : null;
+        const candidates = [base, baseStem, parent].filter((s): s is string => !!s);
+        if (typeof e.title === 'string') candidates.push(e.title);
+        return candidates.includes(name);
+      });
+      if (match && typeof match.path === 'string') return [match.path];
+      // Allow `examples/<name>/index.html` and `examples/<name>.html`
+      // so plugin authors can ship example folders without enumerating
+      // them in the manifest.
+      return [
+        `examples/${name}/index.html`,
+        `examples/${name}.html`,
+      ];
+    });
+  });
+
+  app.get('/api/plugins/:id/asset/*', async (req, res) => {
+    try {
+      const plugin = getInstalledPlugin(db, req.params.id);
+      if (!plugin) return res.status(404).json({ error: 'plugin not found' });
+      const relpath = String(req.params[0] ?? '');
+      // Reject obvious traversal up-front; the path resolution below
+      // normalizes again, but this catches the easy cases without
+      // touching disk.
+      if (!relpath || relpath.includes('..') || relpath.startsWith('/') || relpath.includes('\0')) {
+        return res.status(400).json({ error: 'invalid asset path' });
+      }
+      const path = await import('node:path');
+      const fsp = await import('node:fs/promises');
+      const resolved = path.resolve(plugin.fsPath, relpath);
+      // Final containment check — `resolved` must stay under fsPath.
+      const root = path.resolve(plugin.fsPath) + path.sep;
+      if (!(resolved + path.sep).startsWith(root) && resolved !== path.resolve(plugin.fsPath)) {
+        return res.status(400).json({ error: 'asset escape rejected' });
+      }
+      let buf;
+      try {
+        buf = await fsp.readFile(resolved);
+      } catch {
+        return res.status(404).json({ error: 'asset not found' });
+      }
+      // §9.2 preview CSP — sandboxed iframes get only inline script + style;
+      // no network, no external resources, no document-level forms.
+      res.setHeader(
+        'Content-Security-Policy',
+        "default-src 'none'; img-src 'self' data: blob:; media-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'none'; frame-ancestors 'self'",
+      );
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+      const ext = path.extname(resolved).toLowerCase();
+      const ct =
+        ext === '.html' ? 'text/html; charset=utf-8'
+        : ext === '.js'  ? 'application/javascript; charset=utf-8'
+        : ext === '.css' ? 'text/css; charset=utf-8'
+        : ext === '.json' ? 'application/json; charset=utf-8'
+        : ext === '.svg' ? 'image/svg+xml'
+        : ext === '.png' ? 'image/png'
+        : ext === '.jpg' || ext === '.jpeg' ? 'image/jpeg'
+        : 'application/octet-stream';
+      res.setHeader('Content-Type', ct);
+      res.send(buf);
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  // Plan §3.H2 / spec §12.2 — craft list endpoint.
+  // Mirrors the daemon's existing /api/skills + /api/design-systems
+  // discovery surface so `od craft list` is a thin wrapper over a
+  // single HTTP call. Each entry returns a slug + size + first
+  // markdown header so a code agent can browse without a separate
+  // /api/craft/:id read.
+  app.get('/api/craft', async (_req, res) => {
+    try {
+      const fsp = await import('node:fs/promises');
+      let entries;
+      try {
+        entries = await fsp.readdir(CRAFT_DIR, { withFileTypes: true });
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+          return res.json({ craft: [] });
+        }
+        throw err;
+      }
+      const out = [];
+      for (const entry of entries) {
+        if (!entry.isFile() || !entry.name.endsWith('.md')) continue;
+        const slug = entry.name.replace(/\.md$/, '');
+        try {
+          const fullPath = `${CRAFT_DIR}/${entry.name}`;
+          const text = await fsp.readFile(fullPath, 'utf8');
+          const heading = text.split('\n').find((line) => line.startsWith('# '));
+          out.push({
+            id:     slug,
+            label:  heading ? heading.replace(/^#+\s*/, '').trim() : slug,
+            bytes:  Buffer.byteLength(text, 'utf8'),
+          });
+        } catch {
+          // Skip unreadable files; surface what we can.
+        }
+      }
+      res.json({ craft: out });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.get('/api/craft/:id', async (req, res) => {
+    try {
+      const slug = req.params.id;
+      if (!/^[a-z0-9][a-z0-9-]*$/.test(slug)) {
+        return res.status(400).json({ error: 'invalid craft id' });
+      }
+      const fsp = await import('node:fs/promises');
+      try {
+        const text = await fsp.readFile(`${CRAFT_DIR}/${slug}.md`, 'utf8');
+        res.json({ id: slug, body: text });
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+          return res.status(404).json({ error: 'craft section not found' });
+        }
+        throw err;
+      }
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.get('/api/applied-plugins/:snapshotId', (req, res) => {
+    try {
+      const snap = getSnapshot(db, req.params.snapshotId);
+      if (!snap) return res.status(404).json({ error: 'snapshot not found' });
+      res.json(snap);
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  // Plan §3.DD1 — `od plugin stats`. Aggregates the installed-
+  // plugin roster + the applied_plugin_snapshots roster into one
+  // health/inventory report. Pure helpers in plugins/stats.ts;
+  // the route wires the SQLite reads + merges on the way out.
+  app.get('/api/plugins/stats', async (_req, res) => {
+    try {
+      const { pluginInventoryStats, snapshotInventoryStats } = await import('./plugins/stats.js');
+      const installed = listInstalledPlugins(db);
+      const inventoryRows = db.prepare(
+        `SELECT status, project_id, run_id, applied_at FROM applied_plugin_snapshots`,
+      ).all() as Array<{ status: 'fresh' | 'stale'; project_id: string | null; run_id: string | null; applied_at: number }>;
+      res.json({
+        plugins:   pluginInventoryStats(installed),
+        snapshots: snapshotInventoryStats(inventoryRows),
+        generatedAt: Date.now(),
+      });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  // Plan §3.CC1 — `od plugin canon <snapshotId>`. Returns the
+  // canonical `## Active plugin` block the agent will see when
+  // this snapshot is spliced into the system prompt. Powered by
+  // the same renderPluginBlock() composeSystemPrompt() uses, so
+  // the CLI output is byte-equal to what the agent reads.
+  //
+  // Two response modes:
+  //   - default            : { snapshotId, pluginId, block }
+  //   - Accept: text/plain : raw block body for shell pipes
+  app.get('/api/applied-plugins/:snapshotId/canon', (req, res) => {
+    try {
+      const snap = getSnapshot(db, req.params.snapshotId);
+      if (!snap) return res.status(404).json({ error: 'snapshot not found' });
+      const block = pluginPromptBlock(snap);
+      const accepts = String(req.headers['accept'] ?? '').toLowerCase();
+      if (accepts.includes('text/plain')) {
+        res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+        res.send(block);
+        return;
+      }
+      res.json({ snapshotId: snap.snapshotId, pluginId: snap.pluginId, block });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  // Plan §3.B4 / spec §6: marketplace registry minimum verbs.
+  // Phase 3 layers in `od plugin install <name>` resolution + the trust
+  // UI on top; this route set is the storage half.
+  app.get('/api/marketplaces', async (_req, res) => {
+    try {
+      const { listMarketplaces } = await import('./plugins/marketplaces.js');
+      res.json({ marketplaces: listMarketplaces(db) });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.post('/api/marketplaces', async (req, res) => {
+    try {
+      const body = req.body && typeof req.body === 'object' ? req.body : {};
+      const url = typeof body.url === 'string' ? body.url : '';
+      if (!url) return res.status(400).json({ error: 'url is required' });
+      const trust = body.trust === 'trusted' || body.trust === 'official' ? body.trust : 'restricted';
+      const { addMarketplace } = await import('./plugins/marketplaces.js');
+      const result = await addMarketplace(db, {
+        url,
+        trust,
+        fetcher: createMarketplaceFetcher(
+          marketplaceRegistryIdFromUrl(url),
+          bundledMarketplaceEntries,
+        ),
+      });
+      if (!result.ok) {
+        return res.status(result.status).json({
+          error: { code: 'marketplace-add-failed', message: result.message, data: { errors: result.errors ?? [] } },
+        });
+      }
+      res.status(201).json(result.row);
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.get('/api/marketplaces/:id', async (req, res) => {
+    try {
+      const { getMarketplace } = await import('./plugins/marketplaces.js');
+      const row = getMarketplace(db, req.params.id);
+      if (!row) return res.status(404).json({ error: 'marketplace not found' });
+      res.json(row);
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.delete('/api/marketplaces/:id', async (req, res) => {
+    try {
+      const { removeMarketplace } = await import('./plugins/marketplaces.js');
+      const ok = removeMarketplace(db, req.params.id);
+      if (!ok) return res.status(404).json({ error: 'marketplace not found' });
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.post('/api/marketplaces/:id/refresh', async (req, res) => {
+    try {
+      const { getMarketplace, refreshMarketplace } = await import('./plugins/marketplaces.js');
+      const row = getMarketplace(db, req.params.id);
+      const seedId = row ? marketplaceRegistryIdFromUrl(row.url) ?? req.params.id : req.params.id;
+      const result = await refreshMarketplace(
+        db,
+        req.params.id,
+        createMarketplaceFetcher(seedId, bundledMarketplaceEntries),
+      );
+      if (!result.ok) {
+        return res.status(result.status).json({
+          error: { code: 'marketplace-refresh-failed', message: result.message, data: { errors: result.errors ?? [] } },
+        });
+      }
+      // Plan §3.JJ1 — emit a 'plugin.marketplace-refreshed' event
+      // so ops can audit catalog refreshes via the live tail.
+      try {
+        const { recordPluginEvent } = await import('./plugins/events.js');
+        recordPluginEvent({
+          kind:     'plugin.marketplace-refreshed',
+          pluginId: '',
+          details:  {
+            marketplaceId: req.params.id,
+            marketplaceVersion: result.row.version,
+            specVersion: result.row.specVersion,
+          },
+        });
+      } catch { /* best-effort */ }
+      res.json(result.row);
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.post('/api/marketplaces/:id/trust', async (req, res) => {
+    try {
+      const body = req.body && typeof req.body === 'object' ? req.body : {};
+      const trust = body.trust === 'trusted' || body.trust === 'restricted' || body.trust === 'official'
+        ? body.trust
+        : null;
+      if (!trust) {
+        return res.status(400).json({ error: 'trust must be one of: trusted, restricted, official' });
+      }
+      const { setMarketplaceTrust } = await import('./plugins/marketplaces.js');
+      const row = setMarketplaceTrust(db, req.params.id, trust);
+      if (!row) return res.status(404).json({ error: 'marketplace not found' });
+      res.json(row);
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.get('/api/marketplaces/:id/plugins', async (req, res) => {
+    try {
+      const { getMarketplace } = await import('./plugins/marketplaces.js');
+      const row = getMarketplace(db, req.params.id);
+      if (!row) return res.status(404).json({ error: 'marketplace not found' });
+      res.json({ plugins: row.manifest.plugins ?? [] });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  // Plan §3.A5: list all applied snapshots; useful for `od plugin
+  // snapshots list` and the audit dashboard.
+  app.get('/api/applied-plugins', (_req, res) => {
+    try {
+      const rows = db
+        .prepare(`SELECT id FROM applied_plugin_snapshots ORDER BY applied_at DESC LIMIT 500`)
+        .all();
+      res.json({
+        snapshots: rows.map((r) => getSnapshot(db, (r).id)).filter((x) => x !== null),
+      });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+  app.get('/api/projects/:projectId/applied-plugins', (req, res) => {
+    try {
+      const rows = db
+        .prepare(`SELECT id FROM applied_plugin_snapshots WHERE project_id = ? ORDER BY applied_at DESC`)
+        .all(req.params.projectId);
+      res.json({
+        snapshots: rows.map((r) => getSnapshot(db, (r).id)).filter((x) => x !== null),
+      });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  // Phase 4 / spec §14 — exporter route. Materialises a publish-ready
+  // folder from the snapshot behind a given project (or an explicit
+  // snapshot id). The daemon writes through `outDir` on the host
+  // filesystem, so the CLI is the canonical caller; the route stays
+  // local-loopback-only.
+  app.post('/api/applied-plugins/export', requireLocalDaemonRequest, async (req, res) => {
+    try {
+      const body = req.body && typeof req.body === 'object' ? req.body : {};
+      const target = body.target === 'od' || body.target === 'claude-plugin' || body.target === 'agent-skill'
+        ? body.target
+        : null;
+      if (!target) {
+        return res.status(400).json({ error: 'target must be one of: od, claude-plugin, agent-skill' });
+      }
+      const outDir = typeof body.outDir === 'string' && body.outDir.length > 0
+        ? body.outDir
+        : null;
+      if (!outDir) {
+        return res.status(400).json({ error: 'outDir is required' });
+      }
+      const { exportPlugin, ExportError } = await import('./plugins/export.js');
+      try {
+        const result = await exportPlugin({
+          db,
+          target,
+          outDir,
+          ...(typeof body.snapshotId === 'string' ? { snapshotId: body.snapshotId } : {}),
+          ...(typeof body.projectId  === 'string' ? { projectId:  body.projectId  } : {}),
+        });
+        res.json({ ok: true, ...result });
+      } catch (err) {
+        if (err instanceof ExportError) {
+          return res.status(404).json({ error: err.message });
+        }
+        throw err;
+      }
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  // Plan §3.A5 / spec §16 Phase 5: operator escape hatch for forced
+  // snapshot pruning. The periodic worker (`startSnapshotGc`) runs the
+  // unreferenced-TTL sweep automatically; this endpoint additionally
+  // accepts `{ before: <unix-ms> }` to force-delete unreferenced rows
+  // older than the cutoff. Referenced rows (run_id IS NOT NULL) stay
+  // pinned forever per PB2 reproducibility-first.
+  app.post('/api/applied-plugins/prune', async (req, res) => {
+    try {
+      const body = req.body && typeof req.body === 'object' ? req.body : {};
+      const before = typeof body.before === 'number' ? body.before : undefined;
+      const result = pruneExpiredSnapshots(db, before ? { before } : {});
+      // Plan §3.JJ1 — emit a 'plugin.snapshot-pruned' event when
+      // anything was actually removed, so ops can track GC churn
+      // via the live tail.
+      if (result.removed > 0) {
+        try {
+          const { recordPluginEvent } = await import('./plugins/events.js');
+          recordPluginEvent({
+            kind:     'plugin.snapshot-pruned',
+            pluginId: '',
+            details:  { removed: result.removed, ...(before ? { before } : {}) },
+          });
+        } catch { /* best-effort */ }
+      }
+      res.json({ ok: true, removed: result.removed, ids: result.ids });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  // Phase 2A: GenUI surface read/write + devloop iteration history + replay.
+  // Spec §10.3 for the surface lifecycle, §10.2 for devloop, §11.5 for the
+  // route shapes. The surface writers go through `apps/daemon/src/genui/store.ts`
+  // (sole writer of `genui_surfaces`) so the F8 cross-conversation cache stays
+  // intact.
+  app.get('/api/runs/:runId/genui', (req, res) => {
+    try {
+      const surfaces = listSurfacesForRun(db, req.params.runId);
+      res.json({ runId: req.params.runId, surfaces });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.get('/api/projects/:projectId/genui', (req, res) => {
+    try {
+      const surfaces = listSurfacesForProject(db, req.params.projectId);
+      res.json({ projectId: req.params.projectId, surfaces });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.post('/api/runs/:runId/genui/:surfaceId/respond', async (req, res) => {
+    try {
+      const body = req.body && typeof req.body === 'object' ? req.body : {};
+      const value = 'value' in body ? body.value : null;
+      const respondedBy =
+        body.respondedBy === 'agent' || body.respondedBy === 'auto'
+          ? body.respondedBy
+          : 'user';
+      // The CLI / web pass `surfaceId` (the plugin-declared id) — look up
+      // the matching pending row scoped to the run, then write through.
+      const stmt = db.prepare(
+        `SELECT id FROM genui_surfaces
+          WHERE run_id = ? AND surface_id = ? AND status = 'pending'
+          ORDER BY requested_at DESC LIMIT 1`,
+      );
+      const row = stmt.get(req.params.runId, req.params.surfaceId) as { id?: string } | undefined;
+      if (!row?.id) {
+        return res.status(404).json({ error: 'no pending surface for runId/surfaceId' });
+      }
+      const updated = respondSurfaceRow(db, { rowId: row.id, value, respondedBy });
+
+      // Plan §3.R1 / spec §10.3 / §21.5 — auto-bridge for the
+      // diff-review choice surface. When the surface id matches the
+      // auto-derived prefix, we immediately persist the decision into
+      // the run's project cwd so the next pipeline stage (handoff,
+      // typically) sees `<cwd>/review/decision.json` without a second
+      // turn through the agent. Best-effort: failures don't block the
+      // 200 response — the agent or a follow-up call can retry.
+      let diffReviewBridge: { ok: boolean; error?: string } | undefined;
+      if (isDiffReviewSurfaceId(req.params.surfaceId)) {
+        try {
+          const run = design.runs.get(req.params.runId);
+          const projectId = (run as { projectId?: string | null } | undefined)?.projectId ?? null;
+          if (projectId) {
+            const project = getProject(db, projectId);
+            const metadata = project?.metadata && typeof project.metadata === 'string'
+              ? JSON.parse(project.metadata)
+              : project?.metadata ?? undefined;
+            const cwd = resolveProjectDir(PROJECTS_DIR, projectId, metadata);
+            const bridgeResult = await applyDiffReviewDecisionToCwd({
+              cwd,
+              value,
+              reviewer: respondedBy === 'agent' || respondedBy === 'auto' ? 'agent' : 'user',
+            });
+            diffReviewBridge = bridgeResult.ok ? { ok: true } : { ok: false, error: bridgeResult.error };
+          } else {
+            diffReviewBridge = { ok: false, error: 'run is not linked to a project' };
+          }
+        } catch (err) {
+          diffReviewBridge = { ok: false, error: (err as Error).message };
+          console.warn('[plugins] diff-review bridge failed:', err);
+        }
+      }
+
+      const responsePayload: Record<string, unknown> = { ok: true, surface: updated };
+      if (diffReviewBridge) responsePayload.diffReviewBridge = diffReviewBridge;
+      res.json(responsePayload);
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.post('/api/projects/:projectId/genui/:surfaceId/revoke', (req, res) => {
+    try {
+      const changed = revokeProjectSurface(db, {
+        projectId: req.params.projectId,
+        surfaceId: req.params.surfaceId,
+      });
+      res.json({ ok: true, invalidated: changed });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.post('/api/projects/:projectId/genui/prefill', (req, res) => {
+    try {
+      const body = req.body && typeof req.body === 'object' ? req.body : {};
+      const snapshotId = typeof body.snapshotId === 'string' ? body.snapshotId : '';
+      const surfaceId  = typeof body.surfaceId  === 'string' ? body.surfaceId  : '';
+      const persist    = body.persist === 'run' || body.persist === 'conversation' || body.persist === 'project'
+        ? body.persist
+        : 'project';
+      const kind = body.kind === 'form' || body.kind === 'choice' || body.kind === 'oauth-prompt'
+        ? body.kind
+        : 'confirmation';
+      if (!snapshotId || !surfaceId) {
+        return res.status(400).json({ error: 'snapshotId and surfaceId are required' });
+      }
+      const row = prefillProjectSurface(db, {
+        projectId:        req.params.projectId,
+        pluginSnapshotId: snapshotId,
+        surfaceId,
+        kind,
+        persist,
+        value:            'value' in body ? body.value : null,
+        schema:           body.schema,
+        expiresAt:        typeof body.expiresAt === 'number' ? body.expiresAt : null,
+      });
+      res.json({ ok: true, surface: row });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.get('/api/runs/:runId/genui/:surfaceId', (req, res) => {
+    try {
+      const row = db.prepare(
+        `SELECT id FROM genui_surfaces
+          WHERE run_id = ? AND surface_id = ?
+          ORDER BY requested_at DESC LIMIT 1`,
+      ).get(req.params.runId, req.params.surfaceId) as { id?: string } | undefined;
+      if (!row?.id) return res.status(404).json({ error: 'surface not found' });
+      const surface = getSurface(db, row.id);
+      if (!surface) return res.status(404).json({ error: 'surface not found' });
+      // Plan §6 Phase 2A.5 — enrich the response with the surface
+      // spec (incl. schema, prompt, persist tier) pulled out of the
+      // pinned AppliedPluginSnapshot. This is what `od ui show`
+      // returns to headless callers so a code agent can inspect the
+      // JSON Schema before responding via `od ui respond --value-json`.
+      // The store only persists `schemaDigest` (for the cross-conv
+      // cache); the canonical schema lives on the snapshot.
+      let spec = null;
+      if (surface.pluginSnapshotId) {
+        const snap = getSnapshot(db, surface.pluginSnapshotId);
+        if (snap && Array.isArray(snap.genuiSurfaces)) {
+          spec = snap.genuiSurfaces.find((s) => s?.id === surface.surfaceId) ?? null;
+        }
+      }
+      res.json({ ...surface, spec });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.get('/api/runs/:runId/devloop-iterations', (req, res) => {
+    try {
+      const iterations = listIterationsForRun(db, req.params.runId);
+      res.json({ runId: req.params.runId, iterations });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  // Replay: rebuild a run by reading its `applied_plugin_snapshot_id`
+  // and returning the snapshot for the caller (CLI / agent driver) to
+  // re-launch with. Phase 2A keeps replay headless: the daemon does not
+  // auto-restart the agent — it returns the materialized inputs that
+  // would re-produce the run if re-applied. Spec §8.2.1 invariants
+  // guarantee byte-equality across replays.
+  app.post('/api/runs/:runId/replay', (req, res) => {
+    try {
+      const body = req.body && typeof req.body === 'object' ? req.body : {};
+      const explicitSnapshotId = typeof body.snapshotId === 'string' ? body.snapshotId : '';
+      let snapshotId = explicitSnapshotId;
+      if (!snapshotId) {
+        // Phase 2A keeps `runs` in-memory; the caller must pass `snapshotId`
+        // (e.g. the value persisted on the client after the original apply).
+        // Once `runs.applied_plugin_snapshot_id` lands as a SQL column, the
+        // server resolves the link itself.
+        return res.status(400).json({
+          error: 'snapshotId is required (runs are in-memory; pass the snapshotId returned by /api/plugins/:id/apply)',
+        });
+      }
+      const snapshot = getSnapshot(db, snapshotId);
+      if (!snapshot) return res.status(404).json({ error: 'snapshot not found' });
+      res.json({
+        ok:        true,
+        runId:     req.params.runId,
+        snapshotId,
+        snapshot,
+        // The caller re-launches the agent by re-applying these inputs;
+        // the digest match guarantees byte-equality (§8.2.1).
+        rerun: {
+          pluginId:             snapshot.pluginId,
+          pluginSpecVersion:    snapshot.pluginSpecVersion,
+          pluginVersion:        snapshot.pluginVersion,
+          inputs:               snapshot.inputs,
+          manifestSourceDigest: snapshot.manifestSourceDigest,
+        },
+      });
     } catch (err) {
       res.status(500).json({ error: String(err) });
     }
@@ -3309,9 +6465,7 @@ export async function startServer({
   // file shows up on the next view, no rebuild needed.
   app.get('/api/design-systems/:id/preview', async (req, res) => {
     try {
-      const body =
-        (await readDesignSystem(DESIGN_SYSTEMS_DIR, req.params.id)) ??
-        (await readDesignSystem(USER_DESIGN_SYSTEMS_DIR, req.params.id));
+      const body = await readAvailableDesignSystem(req.params.id);
       if (body === null)
         return res.status(404).type('text/plain').send('not found');
       const html = renderDesignSystemPreview(req.params.id, body);
@@ -3326,9 +6480,7 @@ export async function startServer({
   // /preview: built at request time, no caching.
   app.get('/api/design-systems/:id/showcase', async (req, res) => {
     try {
-      const body =
-        (await readDesignSystem(DESIGN_SYSTEMS_DIR, req.params.id)) ??
-        (await readDesignSystem(USER_DESIGN_SYSTEMS_DIR, req.params.id));
+      const body = await readAvailableDesignSystem(req.params.id);
       if (body === null)
         return res.status(404).type('text/plain').send('not found');
       const html = renderDesignSystemShowcase(req.params.id, body);
@@ -3512,71 +6664,6 @@ export async function startServer({
       res.type(mimeFor(target)).sendFile(target);
     } catch (err) {
       res.status(500).type('text/plain').send(String(err));
-    }
-  });
-
-  // Install a skill from a GitHub URL or local path.
-  app.post('/api/skills/install', async (req, res) => {
-    if (!isLocalSameOrigin(req, resolvedPort)) {
-      return res.status(403).json({ error: 'forbidden' });
-    }
-    try {
-      const result = await installFromTarget(req.body, USER_SKILLS_DIR, 'skill');
-      if (!result.ok) return res.status(400).json({ error: result.error });
-      const skills = await listAllSkills();
-      const skill = findSkillById(skills, req.body.source === 'github'
-        ? sanitizeRepoName(req.body.url)
-        : path.basename(fs.realpathSync.native(req.body.path)));
-      res.json({ skill: skill ? { ...skill, dir: undefined, body: undefined, hasBody: typeof skill.body === 'string' && skill.body.length > 0 } : null });
-    } catch (err) {
-      res.status(500).json({ error: String(err) });
-    }
-  });
-
-  // Uninstall a user-installed skill.
-  app.delete('/api/skills/:id', async (req, res) => {
-    if (!isLocalSameOrigin(req, resolvedPort)) {
-      return res.status(403).json({ error: 'forbidden' });
-    }
-    try {
-      const result = await uninstallById(req.params.id, USER_SKILLS_DIR, SKILLS_DIR, 'skill');
-      if (!result.ok) return res.status(result.status || 400).json({ error: result.error });
-      res.json({ ok: true });
-    } catch (err) {
-      res.status(500).json({ error: String(err) });
-    }
-  });
-
-  // Install a design system from a GitHub URL or local path.
-  app.post('/api/design-systems/install', async (req, res) => {
-    if (!isLocalSameOrigin(req, resolvedPort)) {
-      return res.status(403).json({ error: 'forbidden' });
-    }
-    try {
-      const result = await installFromTarget(req.body, USER_DESIGN_SYSTEMS_DIR, 'design-system');
-      if (!result.ok) return res.status(400).json({ error: result.error });
-      const systems = await listAllDesignSystems();
-      const dsId = req.body.source === 'github'
-        ? sanitizeRepoName(req.body.url)
-        : path.basename(fs.realpathSync.native(req.body.path));
-      const ds = systems.find((s) => s.id === dsId);
-      res.json({ designSystem: ds || null });
-    } catch (err) {
-      res.status(500).json({ error: String(err) });
-    }
-  });
-
-  // Uninstall a user-installed design system.
-  app.delete('/api/design-systems/:id', async (req, res) => {
-    if (!isLocalSameOrigin(req, resolvedPort)) {
-      return res.status(403).json({ error: 'forbidden' });
-    }
-    try {
-      const result = await uninstallById(req.params.id, USER_DESIGN_SYSTEMS_DIR, DESIGN_SYSTEMS_DIR, 'design-system');
-      if (!result.ok) return res.status(result.status || 400).json({ error: result.error });
-      res.json({ ok: true });
-    } catch (err) {
-      res.status(500).json({ error: String(err) });
     }
   });
 
@@ -4302,6 +7389,225 @@ export async function startServer({
     }
   });
 
+  app.post('/api/projects/:id/plugins/install-folder', async (req, res) => {
+    try {
+      const project = getProject(db, req.params.id);
+      if (!project) {
+        sendApiError(res, 404, 'PROJECT_NOT_FOUND', 'project not found');
+        return;
+      }
+      const body = req.body && typeof req.body === 'object' ? req.body : {};
+      const relativePath = normalizeProjectPluginFolderPath(body.path);
+      const projectRoot = resolveProjectDir(PROJECTS_DIR, req.params.id, project.metadata);
+      const folder = await resolveProjectChildDirectory(projectRoot, relativePath);
+      const warnings = [];
+      const log = [];
+      let plugin = null;
+      let message = 'Install finished.';
+      for await (const ev of installPlugin(db, { source: folder, roots: PLUGIN_REGISTRY_ROOTS })) {
+        if (ev.message) log.push(ev.message);
+        if (Array.isArray(ev.warnings)) warnings.splice(0, warnings.length, ...ev.warnings);
+        if (ev.kind === 'success') {
+          plugin = ev.plugin;
+          message = `Installed ${ev.plugin.title}.`;
+          break;
+        }
+        if (ev.kind === 'error') {
+          message = ev.message;
+          break;
+        }
+      }
+      res.status(plugin ? 200 : 400).json({ ok: Boolean(plugin), plugin, warnings, message, log });
+    } catch (err) {
+      const code = err && err.code;
+      const status = code === 'ENOENT' || code === 'ENOTDIR' ? 404 : 400;
+      sendApiError(
+        res,
+        status,
+        status === 404 ? 'PLUGIN_FOLDER_NOT_FOUND' : 'BAD_REQUEST',
+        String(err?.message || err),
+      );
+    }
+  });
+
+  app.post('/api/projects/:id/plugins/publish-github', async (req, res) => {
+    try {
+      const project = getProject(db, req.params.id);
+      if (!project) {
+        sendApiError(res, 404, 'PROJECT_NOT_FOUND', 'project not found');
+        return;
+      }
+      const body = req.body && typeof req.body === 'object' ? req.body : {};
+      const relativePath = normalizeProjectPluginFolderPath(body.path);
+      const projectRoot = resolveProjectDir(PROJECTS_DIR, req.params.id, project.metadata);
+      const folder = await resolveProjectChildDirectory(projectRoot, relativePath);
+      const gh = await ensureGhReady();
+      if (!gh.ok) {
+        res.status(409).json(gh);
+        return;
+      }
+      const meta = await readProjectPluginManifest(folder);
+      const repoName = githubRepoNameFromPluginName(meta.name);
+      const tmp = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'od-plugin-publish-'));
+      const work = path.join(tmp, repoName);
+      await fs.promises.cp(folder, work, { recursive: true });
+      const log = [...(gh.log ?? [])];
+      for (const [cmd, args] of [
+        ['git', ['init']],
+        ['git', ['add', '.']],
+        ['git', ['-c', 'user.name=Open Design', '-c', 'user.email=open-design@example.invalid', 'commit', '-m', `Publish ${meta.title}`]],
+      ]) {
+        const result = await execFileBuffered(cmd, args, { cwd: work });
+        log.push(result.stdout || result.stderr);
+        if (!result.ok) {
+          await fs.promises.rm(tmp, { recursive: true, force: true }).catch(() => undefined);
+          res.status(500).json({ ok: false, code: `${cmd}-failed`, message: `${cmd} failed while preparing the plugin repository.`, log });
+          return;
+        }
+      }
+      const create = await execFileBuffered('gh', [
+        'repo',
+        'create',
+        repoName,
+        '--public',
+        '--source',
+        work,
+        '--push',
+      ], { cwd: work });
+      log.push(create.stdout || create.stderr);
+      if (!create.ok) {
+        await fs.promises.rm(tmp, { recursive: true, force: true }).catch(() => undefined);
+        res.status(500).json({ ok: false, code: 'gh-repo-create-failed', message: 'GitHub repo creation failed.', log });
+        return;
+      }
+      const view = await execFileBuffered('gh', ['repo', 'view', '--json', 'url', '--jq', '.url'], { cwd: work });
+      const url = view.ok && view.stdout ? view.stdout : undefined;
+      await fs.promises.rm(tmp, { recursive: true, force: true }).catch(() => undefined);
+      res.json({
+        ok: true,
+        message: url ? `Published ${meta.title} to ${url}.` : `Published ${meta.title} to GitHub.`,
+        ...(url ? { url } : {}),
+        log,
+      });
+    } catch (err) {
+      res.status(400).json({ ok: false, message: String(err?.message || err), log: [] });
+    }
+  });
+
+  app.post('/api/projects/:id/plugins/contribute-open-design', async (req, res) => {
+    try {
+      const project = getProject(db, req.params.id);
+      if (!project) {
+        sendApiError(res, 404, 'PROJECT_NOT_FOUND', 'project not found');
+        return;
+      }
+      const body = req.body && typeof req.body === 'object' ? req.body : {};
+      const relativePath = normalizeProjectPluginFolderPath(body.path);
+      const projectRoot = resolveProjectDir(PROJECTS_DIR, req.params.id, project.metadata);
+      const folder = await resolveProjectChildDirectory(projectRoot, relativePath);
+      const gh = await ensureGhReady();
+      if (!gh.ok) {
+        res.status(409).json(gh);
+        return;
+      }
+      const meta = await readProjectPluginManifest(folder);
+      const repoName = githubRepoNameFromPluginName(meta.name);
+      const user = await execFileBuffered('gh', ['api', 'user', '--jq', '.login'], { timeout: 20_000 });
+      if (!user.ok || !user.stdout) {
+        res.status(409).json({
+          ok: false,
+          code: 'gh-user-unavailable',
+          message: 'Could not read the authenticated GitHub user from gh.',
+          log: [...(gh.log ?? []), user.stderr || user.stdout],
+        });
+        return;
+      }
+      const login = user.stdout.trim();
+      const tmp = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'od-plugin-pr-'));
+      const work = path.join(tmp, 'open-design');
+      const branch = `plugin/${repoName}-${Date.now()}`;
+      const dest = path.join(work, 'plugins', 'community', repoName);
+      const bodyText = [
+        `Adds ${meta.title} as a community Open Design plugin.`,
+        '',
+        '## Source',
+        '',
+        `- Generated from project: ${project.id}`,
+        `- Manifest name: \`${meta.name}\``,
+        `- Version: \`${meta.version}\``,
+        '',
+        '## Checklist',
+        '',
+        '- [ ] Maintainer reviewed manifest metadata',
+        '- [ ] Maintainer verified plugin skill instructions',
+      ].join('\n');
+      const log = [...(gh.log ?? [])];
+      for (const [cmd, args, opts] of [
+        ['gh', ['repo', 'fork', 'nexu-io/open-design', '--remote=false'], { cwd: tmp }],
+        ['gh', ['repo', 'clone', 'nexu-io/open-design', work], { cwd: tmp }],
+        ['git', ['checkout', '-b', branch], { cwd: work }],
+        ['git', ['remote', 'add', 'fork', `https://github.com/${login}/open-design.git`], { cwd: work }],
+      ]) {
+        const result = await execFileBuffered(cmd, args, opts);
+        log.push(result.stdout || result.stderr);
+        const toleratedExistingFork =
+          cmd === 'gh' && args[0] === 'repo' && args[1] === 'fork' &&
+          /already exists|existing fork/i.test(String(result.stderr || result.stdout));
+        const toleratedExistingRemote =
+          cmd === 'git' && args[0] === 'remote' &&
+          /already exists/i.test(String(result.stderr || result.stdout));
+        if (!result.ok && !toleratedExistingFork && !toleratedExistingRemote) {
+          await fs.promises.rm(tmp, { recursive: true, force: true }).catch(() => undefined);
+          res.status(500).json({ ok: false, code: `${cmd}-failed`, message: `${cmd} failed while preparing the Open Design PR.`, log });
+          return;
+        }
+      }
+      await fs.promises.mkdir(path.dirname(dest), { recursive: true });
+      await fs.promises.cp(folder, dest, { recursive: true });
+      for (const [cmd, args] of [
+        ['git', ['add', `plugins/community/${repoName}`]],
+        ['git', ['-c', 'user.name=Open Design', '-c', 'user.email=open-design@example.invalid', 'commit', '-m', `Add ${meta.title} plugin`]],
+        ['git', ['push', '-u', 'fork', branch]],
+      ]) {
+        const result = await execFileBuffered(cmd, args, { cwd: work });
+        log.push(result.stdout || result.stderr);
+        if (!result.ok) {
+          await fs.promises.rm(tmp, { recursive: true, force: true }).catch(() => undefined);
+          res.status(500).json({ ok: false, code: `${cmd}-failed`, message: `${cmd} failed while preparing the Open Design PR.`, log });
+          return;
+        }
+      }
+      const pr = await execFileBuffered('gh', [
+        'pr',
+        'create',
+        '--repo',
+        'nexu-io/open-design',
+        '--head',
+        `${login}:${branch}`,
+        '--base',
+        'main',
+        '--title',
+        `Add ${meta.title} plugin`,
+        '--body',
+        bodyText,
+      ], { cwd: work });
+      log.push(pr.stdout || pr.stderr);
+      await fs.promises.rm(tmp, { recursive: true, force: true }).catch(() => undefined);
+      if (!pr.ok) {
+        res.status(500).json({ ok: false, code: 'gh-pr-create-failed', message: 'Open Design PR creation failed.', log });
+        return;
+      }
+      res.json({
+        ok: true,
+        message: `Created Open Design PR for ${meta.title}.`,
+        url: pr.stdout || undefined,
+        log,
+      });
+    } catch (err) {
+      res.status(400).json({ ok: false, message: String(err?.message || err), log: [] });
+    }
+  });
+
   app.get('/api/projects/:id/search', async (req, res) => {
     try {
       const query = String(req.query.q ?? '');
@@ -4616,35 +7922,6 @@ export async function startServer({
     },
   );
 
-  app.post('/api/projects/:id/files/rename', async (req, res) => {
-    try {
-      const { from, to } = req.body || {};
-      if (typeof from !== 'string' || typeof to !== 'string') {
-        return sendApiError(res, 400, 'BAD_REQUEST', 'from and to required');
-      }
-      const project = getProject(db, req.params.id);
-      const result = await renameProjectFile(
-        PROJECTS_DIR,
-        req.params.id,
-        from,
-        to,
-        project?.metadata,
-      );
-      /** @type {import('@open-design/contracts').RenameProjectFileResponse} */
-      const body = result;
-      res.json(body);
-    } catch (err) {
-      const code = err && err.code;
-      if (code === 'ENOENT') {
-        return sendApiError(res, 404, 'FILE_NOT_FOUND', 'file not found');
-      }
-      if (code === 'EEXIST') {
-        return sendApiError(res, 409, 'FILE_EXISTS', 'target file already exists');
-      }
-      sendApiError(res, 400, 'BAD_REQUEST', String(err?.message || err));
-    }
-  });
-
   app.delete('/api/projects/:id/files/:name', async (req, res) => {
     try {
       const delProject = getProject(db, req.params.id);
@@ -4751,356 +8028,6 @@ export async function startServer({
         .status(500)
         .json({ error: String(err && err.message ? err.message : err) });
     }
-  });
-
-  // ---------- routines ----------
-
-  // Map a DB row to the Routine contract shape. Schedule lives in
-  // schedule_json (the canonical form); when missing (rows written before
-  // that column existed) we fall back to the legacy daily-only kind/value
-  // pair with UTC as a safe default timezone.
-  function routineDbRowToContract(row, latestRun) {
-    let schedule;
-    if (row.scheduleJson) {
-      try {
-        schedule = JSON.parse(row.scheduleJson);
-      } catch {
-        schedule = null;
-      }
-    }
-    if (!schedule) {
-      // Legacy fallback: daily HH:MM in UTC.
-      schedule = {
-        kind: row.scheduleKind || 'daily',
-        time: row.scheduleValue || '09:00',
-        timezone: 'UTC',
-      };
-    }
-    const target = row.projectMode === 'reuse' && row.projectId
-      ? { mode: 'reuse', projectId: row.projectId }
-      : { mode: 'create_each_run' };
-    let lastRun = null;
-    if (latestRun) {
-      lastRun = {
-        runId: latestRun.id,
-        status: latestRun.status,
-        trigger: latestRun.trigger,
-        startedAt: latestRun.startedAt,
-        ...(latestRun.completedAt == null ? {} : { completedAt: latestRun.completedAt }),
-        projectId: latestRun.projectId,
-        conversationId: latestRun.conversationId,
-        agentRunId: latestRun.agentRunId,
-        ...(latestRun.summary ? { summary: latestRun.summary } : {}),
-      };
-    }
-    return {
-      id: row.id,
-      name: row.name,
-      prompt: row.prompt,
-      schedule,
-      target,
-      skillId: row.skillId ?? null,
-      agentId: row.agentId ?? null,
-      enabled: row.enabled === true || row.enabled === 1,
-      nextRunAt: null,
-      lastRun,
-      createdAt: row.createdAt,
-      updatedAt: row.updatedAt,
-    };
-  }
-
-  // Serialize a schedule into the kind/value/json triple stored in SQLite.
-  // schedule_value carries a kind-specific stringified scalar (minute for
-  // hourly, "HH:MM" for time-of-day kinds) so existing simple queries keep
-  // working; schedule_json is the authoritative form.
-  function scheduleToDbCols(schedule) {
-    const json = JSON.stringify(schedule);
-    let value = '';
-    if (schedule.kind === 'hourly') value = String(schedule.minute);
-    else if (schedule.kind === 'weekly') value = `${schedule.weekday}:${schedule.time}`;
-    else value = schedule.time;
-    return { scheduleKind: schedule.kind, scheduleValue: value, scheduleJson: json };
-  }
-
-  function routineFromDb(id) {
-    const row = getRoutine(db, id);
-    if (!row) return null;
-    const latest = getLatestRoutineRun(db, id);
-    const contract = routineDbRowToContract(row, latest);
-    const nextDate = routineService?.nextRunAt(id) ?? null;
-    contract.nextRunAt = nextDate ? nextDate.getTime() : null;
-    return contract;
-  }
-
-  function validateRoutineInput(body, partial) {
-    if (!body || typeof body !== 'object') {
-      throw new Error('Request body must be an object');
-    }
-    if (!partial || body.name !== undefined) {
-      if (typeof body.name !== 'string' || !body.name.trim()) {
-        throw new Error('name is required');
-      }
-    }
-    if (!partial || body.prompt !== undefined) {
-      if (typeof body.prompt !== 'string' || !body.prompt.trim()) {
-        throw new Error('prompt is required');
-      }
-    }
-    if (!partial || body.schedule !== undefined) {
-      validateRoutineSchedule(body.schedule);
-    }
-    if (!partial || body.target !== undefined) {
-      validateRoutineTarget(body.target);
-      if (body.target.mode === 'reuse') {
-        const proj = getProject(db, body.target.projectId);
-        if (!proj) throw new Error(`target project ${body.target.projectId} not found`);
-      }
-    }
-  }
-
-  // Each routine fire: resolve agent, mint (or reuse) project + a fresh
-  // conversation, prime the user/assistant message pair, and dispatch into
-  // startChatRun. Returns the in-flight handles so the service can persist
-  // the routine_run row and observe completion.
-  routineService.setRunHandler(async ({ routine, trigger, startedAt, runId }) => {
-    const appConfig = await readAppConfig(RUNTIME_DATA_DIR);
-    let agentId = routine.agentId
-      || (typeof appConfig.agentId === 'string' && appConfig.agentId ? appConfig.agentId : null);
-    if (!agentId) {
-      const agents = await detectAgents(appConfig.agentCliEnv ?? {}).catch(() => []);
-      agentId = agents.find((agent) => agent.available)?.id ?? null;
-    }
-    if (!agentId) {
-      throw new Error('No available agent is configured. Choose an agent in Settings first.');
-    }
-
-    const now = startedAt;
-    const stamp = formatLocalProjectTimestamp(new Date(now).toISOString());
-
-    let projectId;
-    let projectName;
-    if (routine.target.mode === 'reuse') {
-      const proj = getProject(db, routine.target.projectId);
-      if (!proj) throw new Error(`Routine target project ${routine.target.projectId} not found`);
-      projectId = proj.id;
-      projectName = proj.name;
-    } else {
-      projectId = `routine-${randomUUID()}`;
-      projectName = `${routine.name} · ${stamp}`;
-      insertProject(db, {
-        id: projectId,
-        name: projectName,
-        skillId: routine.skillId ?? null,
-        designSystemId: appConfig.designSystemId ?? null,
-        pendingPrompt: null,
-        metadata: { kind: 'other', intent: 'routine', routineId: routine.id, trigger },
-        createdAt: now,
-        updatedAt: now,
-      });
-    }
-
-    const conversationId = `routine-conv-${randomUUID()}`;
-    const conversationTitle = routine.target.mode === 'reuse'
-      ? `${routine.name} · ${stamp}`
-      : projectName;
-    insertConversation(db, {
-      id: conversationId,
-      projectId,
-      title: conversationTitle,
-      createdAt: now,
-      updatedAt: now,
-    });
-
-    const assistantMessageId = `routine-assistant-${randomUUID()}`;
-    const run = design.runs.create({
-      projectId,
-      conversationId,
-      assistantMessageId,
-      clientRequestId: `routine-${trigger}-${randomUUID()}`,
-      agentId,
-    });
-    upsertMessage(db, conversationId, {
-      id: `routine-user-${run.id}`,
-      role: 'user',
-      content: routine.prompt,
-    });
-    upsertMessage(db, conversationId, {
-      id: assistantMessageId,
-      role: 'assistant',
-      content: '',
-      agentId,
-      agentName: getAgentDef(agentId)?.name ?? agentId,
-      runId: run.id,
-      runStatus: 'queued',
-      startedAt: now,
-    });
-
-    const modelPrefs = appConfig.agentModels?.[agentId] ?? {};
-    design.runs.start(run, () => startChatRun({
-      agentId,
-      projectId,
-      conversationId: run.conversationId,
-      assistantMessageId: run.assistantMessageId,
-      clientRequestId: run.clientRequestId,
-      skillId: routine.skillId ?? null,
-      designSystemId: appConfig.designSystemId ?? null,
-      model: modelPrefs.model ?? null,
-      reasoning: modelPrefs.reasoning ?? null,
-      message: routine.prompt,
-      systemPrompt: [
-        `You are running an unattended scheduled routine named "${routine.name}".`,
-        'Do not ask follow-up questions, do not emit <question-form>, and do not wait for user input. Pick reasonable defaults and finish the task.',
-      ].join('\n'),
-    }, run));
-
-    const completion = (async () => {
-      const finalStatus = await design.runs.wait(run);
-      db.prepare(`UPDATE messages SET run_status = ?, ended_at = ? WHERE id = ?`)
-        .run(finalStatus.status, Date.now(), assistantMessageId);
-      return {
-        status: finalStatus.status,
-        summary: `Routine "${routine.name}" ${finalStatus.status}.`,
-      };
-    })();
-
-    return { projectId, conversationId, agentRunId: run.id, completion };
-  });
-
-  app.get('/api/routines', (req, res) => {
-    if (!isLocalSameOrigin(req, resolvedPort)) {
-      return res.status(403).json({ error: 'cross-origin request rejected' });
-    }
-    try {
-      const rows = listRoutines(db);
-      const routines = rows.map((row) => {
-        const latest = getLatestRoutineRun(db, row.id);
-        const contract = routineDbRowToContract(row, latest);
-        const nextDate = routineService?.nextRunAt(row.id) ?? null;
-        contract.nextRunAt = nextDate ? nextDate.getTime() : null;
-        return contract;
-      });
-      res.json({ routines });
-    } catch (err) {
-      res.status(500).json({ error: String(err?.message ?? err) });
-    }
-  });
-
-  app.post('/api/routines', (req, res) => {
-    if (!isLocalSameOrigin(req, resolvedPort)) {
-      return res.status(403).json({ error: 'cross-origin request rejected' });
-    }
-    try {
-      const body = req.body || {};
-      validateRoutineInput(body, false);
-      const id = `routine-${randomUUID()}`;
-      const now = Date.now();
-      const scheduleCols = scheduleToDbCols(body.schedule);
-      insertRoutine(db, {
-        id,
-        name: body.name.trim(),
-        prompt: body.prompt,
-        ...scheduleCols,
-        projectMode: body.target.mode,
-        projectId: body.target.mode === 'reuse' ? body.target.projectId : null,
-        skillId: body.skillId ?? null,
-        agentId: body.agentId ?? null,
-        enabled: body.enabled !== false,
-        createdAt: now,
-        updatedAt: now,
-      });
-      routineService?.rescheduleOne(id);
-      const routine = routineFromDb(id);
-      res.status(201).json({ routine });
-    } catch (err) {
-      res.status(400).json({ error: String(err?.message ?? err) });
-    }
-  });
-
-  app.get('/api/routines/:id', (req, res) => {
-    if (!isLocalSameOrigin(req, resolvedPort)) {
-      return res.status(403).json({ error: 'cross-origin request rejected' });
-    }
-    const routine = routineFromDb(req.params.id);
-    if (!routine) return res.status(404).json({ error: 'routine not found' });
-    res.json({ routine });
-  });
-
-  app.patch('/api/routines/:id', (req, res) => {
-    if (!isLocalSameOrigin(req, resolvedPort)) {
-      return res.status(403).json({ error: 'cross-origin request rejected' });
-    }
-    try {
-      const existing = getRoutine(db, req.params.id);
-      if (!existing) return res.status(404).json({ error: 'routine not found' });
-      const body = req.body || {};
-      validateRoutineInput(body, true);
-      const patch = {};
-      if (body.name !== undefined) patch.name = body.name.trim();
-      if (body.prompt !== undefined) patch.prompt = body.prompt;
-      if (body.schedule !== undefined) {
-        const cols = scheduleToDbCols(body.schedule);
-        patch.scheduleKind = cols.scheduleKind;
-        patch.scheduleValue = cols.scheduleValue;
-        patch.scheduleJson = cols.scheduleJson;
-      }
-      if (body.target !== undefined) {
-        patch.projectMode = body.target.mode;
-        patch.projectId = body.target.mode === 'reuse' ? body.target.projectId : null;
-      }
-      if (body.skillId !== undefined) patch.skillId = body.skillId ?? null;
-      if (body.agentId !== undefined) patch.agentId = body.agentId ?? null;
-      if (body.enabled !== undefined) patch.enabled = Boolean(body.enabled);
-      updateRoutine(db, req.params.id, patch);
-      routineService?.rescheduleOne(req.params.id);
-      const routine = routineFromDb(req.params.id);
-      res.json({ routine });
-    } catch (err) {
-      res.status(400).json({ error: String(err?.message ?? err) });
-    }
-  });
-
-  app.delete('/api/routines/:id', (req, res) => {
-    if (!isLocalSameOrigin(req, resolvedPort)) {
-      return res.status(403).json({ error: 'cross-origin request rejected' });
-    }
-    routineService?.unschedule(req.params.id);
-    const removed = dbDeleteRoutine(db, req.params.id);
-    if (!removed) return res.status(404).json({ error: 'routine not found' });
-    res.status(204).end();
-  });
-
-  app.post('/api/routines/:id/run', async (req, res) => {
-    if (!isLocalSameOrigin(req, resolvedPort)) {
-      return res.status(403).json({ error: 'cross-origin request rejected' });
-    }
-    try {
-      if (!routineService) throw new Error('routine service unavailable');
-      const existing = getRoutine(db, req.params.id);
-      if (!existing) return res.status(404).json({ error: 'routine not found' });
-      const start = await routineService.runNow(req.params.id);
-      const latest = getLatestRoutineRun(db, req.params.id);
-      const routine = routineFromDb(req.params.id);
-      res.status(202).json({
-        routine,
-        run: latest,
-        projectId: start.projectId,
-        conversationId: start.conversationId,
-        agentRunId: start.agentRunId,
-      });
-    } catch (err) {
-      res.status(500).json({ error: String(err?.message ?? err) });
-    }
-  });
-
-  app.get('/api/routines/:id/runs', (req, res) => {
-    if (!isLocalSameOrigin(req, resolvedPort)) {
-      return res.status(403).json({ error: 'cross-origin request rejected' });
-    }
-    const existing = getRoutine(db, req.params.id);
-    if (!existing) return res.status(404).json({ error: 'routine not found' });
-    const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 20));
-    const runs = listRoutineRuns(db, req.params.id, limit);
-    res.json({ runs });
   });
 
   // Native OS folder picker dialog. Returns { path: string | null }.
@@ -5343,29 +8270,16 @@ export async function startServer({
     },
   );
 
-  const design = {
-    runs: createChatRunService({ createSseResponse, createSseErrorPayload }),
-  };
-
-  // Tracks runs whose completion has already been forwarded to Langfuse so
-  // that repeated PUT /messages/:id calls (web buffers + retries) only emit
-  // one trace per run. Entries are scrubbed when the run's TTL window
-  // expires (30 min, mirrors runs.ts).
-  const reportedRuns = new Set();
-
-  // App-version snapshot read once at server start. Used as static metadata
-  // on every Langfuse trace so we can correlate behaviour with releases
-  // without paying the package.json read cost per turn. Updates require a
-  // daemon restart, which is fine — version doesn't change in-process.
-  let cachedAppVersion = null;
-  void (async () => {
-    try {
-      cachedAppVersion = await readCurrentAppVersionInfo();
-    } catch {
-      // Telemetry is best-effort; running with appVersion === null just
-      // omits the field from the trace.
-    }
-  })();
+  // `design` already declared once above (after the chat-run service is
+  // wired into the main daemon dependency graph). The garnet legacy block
+  // re-introduced it here; duplicate declarations crash the esbuild
+  // transformer at boot. Re-using the earlier `design` is correct — the
+  // inline routes below want the same runs service as the registered
+  // route modules.
+  // main: file-upload routes lifted to a dedicated module. Keep alongside the
+  // inline routes garnet still owns above; duplicate registrations resolve in
+  // a follow-up after route-routes.ts vs garnet inline coverage is audited.
+  registerProjectUploadRoutes(app, { http: httpDeps, uploads: uploadDeps, node: nodeDeps });
 
   const composeDaemonSystemPrompt = async ({
     agentId,
@@ -5374,6 +8288,7 @@ export async function startServer({
     designSystemId,
     streamFormat,
     connectedExternalMcp,
+    appliedPluginSnapshotId,
   }) => {
     const project =
       typeof projectId === 'string' && projectId
@@ -5392,9 +8307,17 @@ export async function startServer({
     let skillMode;
     let skillCraftRequires = [];
     let activeSkillDir = null;
+    // Per-skill Critique Theater override sourced from
+    // `od.critique.policy` in the resolved skill's SKILL.md frontmatter.
+    // `null` means the skill has no opinion and the lower-priority tiers
+    // (project override, env override, rollout phase default) decide.
+    let skillCritiquePolicy: SkillCritiquePolicy = null;
     if (effectiveSkillId) {
+      // Span both functional skills and design templates so a project
+      // saved against either surface keeps its system prompt after the
+      // skills/design-templates split. See specs/current/skills-and-design-templates.md.
       const skill = findSkillById(
-        await listAllSkills(),
+        await listAllSkillLikeEntries(),
         effectiveSkillId,
       );
       if (skill) {
@@ -5402,50 +8325,202 @@ export async function startServer({
         skillName = skill.name;
         skillMode = skill.mode;
         activeSkillDir = skill.dir;
+        skillCritiquePolicy = skill.critiquePolicy;
         if (Array.isArray(skill.craftRequires))
           skillCraftRequires = skill.craftRequires;
       }
     }
 
+    // Stage A of plugin-driven-flow-plan: when the run is bound to a
+    // plugin snapshot, prefer the plugin's local SKILL.md (declared via
+    // `od.context.skills[{ path: './SKILL.md' }]`) over the global
+    // skill. Without this override the agent loses the plugin's
+    // template / token / layout rules and falls back to generic prompt
+    // behaviour even though the user explicitly applied the plugin.
+    if (
+      typeof appliedPluginSnapshotId === 'string'
+      && appliedPluginSnapshotId.length > 0
+    ) {
+      try {
+        const snap = getSnapshot(db, appliedPluginSnapshotId);
+        if (snap?.pluginId) {
+          const plugin = getInstalledPlugin(db, snap.pluginId);
+          if (plugin) {
+            const { loadPluginLocalSkill } = await import('./plugins/local-skill.js');
+            const local = await loadPluginLocalSkill(plugin);
+            if (local) {
+              skillBody = local.body;
+              skillName = local.name;
+              activeSkillDir = local.dir;
+            }
+          }
+        }
+      } catch (err) {
+        console.warn(
+          `[plugins] pluginSkillBody load failed: ${err?.message ?? err}`,
+        );
+      }
+    }
+
     let craftBody;
     let craftSections;
-    if (skillCraftRequires.length > 0) {
-      const loaded = await loadCraftSections(CRAFT_DIR, skillCraftRequires);
+
+    // Personal-memory body is always recomputed at compose time so a
+    // memory the user just edited in settings shows up on the very next
+    // run. composeMemoryBody returns '' when memory is disabled or
+    // empty; the composer drops the block on a falsy value.
+    let memoryBody = '';
+    try {
+      memoryBody = await composeMemoryBody(RUNTIME_DATA_DIR);
+    } catch (err) {
+      console.warn('[memory] composeMemoryBody failed', err);
+    }
+
+    // User-level custom instructions from app-config.json.
+    let userInstructions = '';
+    try {
+      const appCfg = await readAppConfig(RUNTIME_DATA_DIR);
+      if (appCfg.customInstructions) userInstructions = appCfg.customInstructions;
+    } catch (err) {
+      console.warn('[custom-instructions] readAppConfig failed', err);
+    }
+
+    // Project-level custom instructions from the projects table.
+    const projectInstructions = project?.customInstructions ?? '';
+
+    let designSystemBody;
+    let designSystemTitle;
+    // Compiled (tokens.css + components manifest / components.html)
+    // form of the active brand.
+    // Default-on as of PR-D — every chat that picks a brand with
+    // `tokens.css` + `components.html` siblings (today: `default` and
+    // `kami`; every other brand falls through silently because the
+    // files are absent) gets the structured token contract appended to
+    // the system prompt automatically.
+    //
+    // `OD_DESIGN_TOKEN_CHANNEL=0` is the kill switch: it forces the
+    // daemon back to the pre-PR-C DESIGN.md-only path for every brand,
+    // including the structured ones. Any other value (unset, `1`,
+    // `true`, etc.) keeps the new default. Drift on prose-only brands
+    // is pinned by `scripts/check-design-system-flag-parity.ts`.
+    let designSystemUsageMd;
+    let designSystemTokensCss;
+    let designSystemComponentsManifest;
+    let designSystemFixtureHtml;
+    let designSystemPullIndex;
+    let designSystemImportMode;
+    let designSystemCraftApplies = [];
+    let designSystemCraftExemptions = [];
+    if (effectiveDesignSystemId) {
+      let systems = await listAllDesignSystems();
+      let summary = systems.find((s) => s.id === effectiveDesignSystemId);
+      if (summary?.source === 'user') {
+        await ensureUserDesignSystemWorkspaceProject(db, effectiveDesignSystemId);
+        systems = await listAllDesignSystems();
+        summary = systems.find((s) => s.id === effectiveDesignSystemId);
+      }
+      const editingOwnDraftDesignSystem =
+        project?.metadata?.importedFrom === 'design-system'
+        && project.designSystemId === effectiveDesignSystemId;
+      designSystemTitle = summary?.title;
+      if (summary && (isProjectUsableDesignSystem(summary) || editingOwnDraftDesignSystem)) {
+        const workspaceBody = await readDesignSystemWorkspaceTextFile(db, summary, 'DESIGN.md');
+        const registryBody = await readAvailableDesignSystem(effectiveDesignSystemId);
+        designSystemBody = (workspaceBody ?? registryBody) ?? undefined;
+        // Single seam: env gate + built-in→user-installed fallback chain
+        // live together inside `resolveDesignSystemAssets` so the whole
+        // server-side asset-resolution path can be tested end-to-end
+        // from real disk fixtures (see `tests/design-system-assets.test.ts`).
+        const assets = await resolveDesignSystemAssets(
+          effectiveDesignSystemId,
+          DESIGN_SYSTEMS_DIR,
+          USER_DESIGN_SYSTEMS_DIR,
+        );
+        designSystemUsageMd = assets.usageMd;
+        designSystemTokensCss = assets.tokensCss;
+        designSystemComponentsManifest = assets.componentsManifest;
+        designSystemFixtureHtml = assets.fixtureHtml;
+        designSystemPullIndex = assets.pullIndex;
+        designSystemImportMode = assets.importMode;
+        designSystemCraftApplies = Array.isArray(assets.craftApplies) ? assets.craftApplies : [];
+        designSystemCraftExemptions = Array.isArray(assets.craftExemptions) ? assets.craftExemptions : [];
+      }
+    }
+
+    const excludedCraft = new Set(designSystemCraftExemptions);
+    const requestedCraft = Array.from(
+      new Set([...skillCraftRequires, ...designSystemCraftApplies]),
+    ).filter((slug) => !excludedCraft.has(slug));
+    if (requestedCraft.length > 0) {
+      const loaded = await loadCraftSections(CRAFT_DIR, requestedCraft);
       if (loaded.body) {
         craftBody = loaded.body;
         craftSections = loaded.sections;
       }
     }
 
-    let designSystemBody;
-    let designSystemTitle;
-    if (effectiveDesignSystemId) {
-      const systems = await listAllDesignSystems();
-      const summary = systems.find((s) => s.id === effectiveDesignSystemId);
-      designSystemTitle = summary?.title;
-      designSystemBody =
-        (await readDesignSystem(DESIGN_SYSTEMS_DIR, effectiveDesignSystemId)) ??
-        (await readDesignSystem(USER_DESIGN_SYSTEMS_DIR, effectiveDesignSystemId)) ??
-        undefined;
-    }
-
     const template =
       metadata?.kind === 'template' && typeof metadata.templateId === 'string'
         ? (getTemplate(db, metadata.templateId) ?? undefined)
         : undefined;
+    let audioVoiceOptions = [];
+    let audioVoiceOptionsError;
+    if (
+      metadata?.kind === 'audio' &&
+      metadata?.audioKind === 'speech' &&
+      metadata?.audioModel === 'elevenlabs-v3' &&
+      !metadata?.voice
+    ) {
+      try {
+        audioVoiceOptions = await listElevenLabsVoiceOptions(PROJECT_ROOT, { limit: 100 });
+      } catch (err) {
+        audioVoiceOptionsError = err && err.message ? err.message : String(err);
+        console.warn('[elevenlabs] voice option lookup failed:', audioVoiceOptionsError);
+      }
+    }
 
     // Thread the critique config plus the active design-system / skill data
     // into the composer when critique is enabled. Without this the spawned
     // child receives the legacy single-pass prompt and the parser waits for
     // <CRITIQUE_RUN> tags the model was never told to emit. The composer
-    // itself ignores these fields when cfg.enabled is false, so the legacy
-    // path stays untouched.
-    const critiqueBrand = critiqueCfg.enabled
+    // itself ignores these fields when the top-line gate is false, so the
+    // legacy path stays untouched.
+    //
+    // Top-line gate (post-Phase-15 wireup): the daemon now routes every
+    // candidate run through the rollout resolver instead of reading the
+    // env-var flag directly. The resolver carries the full priority
+    // matrix: skill `od.critique.policy` veto > project override > env
+    // override > rollout phase default. On a fresh install with M0
+    // dark-launch defaults the resolver returns `false`, so prod traffic
+    // is unchanged until an operator flips the env var or a project
+    // opts in. The skill-policy input is sourced from
+    // `od.critique.policy` in the active skill's SKILL.md frontmatter
+    // (parsed in `skills.ts:normalizeCritiquePolicy`). The project
+    // override input is sourced from the `critiqueTheaterEnabled`
+    // field on the project's metadata blob, which is what the M1
+    // Settings toggle writes through the existing settings endpoint.
+    // Both inputs collapse to `null` when the skill / project has
+    // not expressed an opinion, which is the resolver's "fall through
+    // to env / phase default" signal.
+    // Per-project override: the M1 Settings toggle writes
+    // `critiqueTheaterEnabled` onto the project's metadata blob via
+    // the existing settings round-trip. A boolean wins outright; any
+    // other type (missing key, malformed value) collapses to `null`
+    // so the resolver falls through to the env / phase tiers exactly
+    // the way it did when the toggle had never been touched.
+    const projectCritiqueOverride = narrowProjectCritiqueOverride(metadata);
+    const critiqueEnabledForRun = isCritiqueEnabled({
+      phase: parseRolloutPhase(process.env.OD_CRITIQUE_ROLLOUT_PHASE),
+      skillPolicy: skillCritiquePolicy,
+      projectOverride: projectCritiqueOverride,
+      envOverride: parseEnvEnabled(process.env.OD_CRITIQUE_ENABLED),
+    });
+    const critiqueBrand = critiqueEnabledForRun
       && typeof designSystemTitle === 'string'
       && typeof designSystemBody === 'string'
       ? { name: designSystemTitle, design_md: designSystemBody }
       : undefined;
-    const critiqueSkill = critiqueCfg.enabled && typeof effectiveSkillId === 'string'
+    const critiqueSkill = critiqueEnabledForRun && typeof effectiveSkillId === 'string'
       ? { id: effectiveSkillId }
       : undefined;
     // Single-source-of-truth eligibility check. The composer downstream
@@ -5468,7 +8543,7 @@ export async function startServer({
       metadata?.kind === 'video' ||
       metadata?.kind === 'audio';
     const isPlainAdapter = (streamFormat ?? 'plain') === 'plain';
-    const critiqueShouldRun = critiqueCfg.enabled
+    const critiqueShouldRun = critiqueEnabledForRun
       && critiqueBrand !== undefined
       && critiqueSkill !== undefined
       && !isMediaSurface
@@ -5479,6 +8554,54 @@ export async function startServer({
     // non-plain adapters and we'd emit the panel for a run the orchestrator
     // skips. Gating the threading itself keeps composer + orchestrator in
     // exact lockstep regardless of which side enforces eligibility.
+    let pluginBlock;
+    if (
+      typeof appliedPluginSnapshotId === 'string'
+      && appliedPluginSnapshotId.length > 0
+    ) {
+      try {
+        const snap = getSnapshot(db, appliedPluginSnapshotId);
+        if (snap) pluginBlock = pluginPromptBlock(snap);
+      } catch (err) {
+        console.warn(
+          `[plugins] pluginBlock build failed: ${err?.message ?? err}`,
+        );
+      }
+    }
+
+    // Plan §3.M2 / §3.V1 / spec §23.4 — render each stage's atoms[]
+    // into `## Active stage` blocks via the contracts helper when
+    // the run carries a snapshot with a pipeline. Default is now ON
+    // (flipped in §3.V1 once the bundled SKILL.md fragments covered
+    // every Phase 6/7/8 atom); set OD_BUNDLED_ATOM_PROMPTS=0 to opt
+    // out (the runs that need pre-§3.V1 byte-equal prompts: snapshot
+    // replay against an older daemon, regression-bisects).
+    let activeStageBlocks;
+    const bundledAtomPromptsEnabled = process.env.OD_BUNDLED_ATOM_PROMPTS !== '0';
+    if (
+      bundledAtomPromptsEnabled
+      && typeof appliedPluginSnapshotId === 'string'
+      && appliedPluginSnapshotId.length > 0
+    ) {
+      try {
+        const snap = getSnapshot(db, appliedPluginSnapshotId);
+        const stages = snap?.pipeline?.stages ?? [];
+        if (stages.length > 0) {
+          const { loadAtomBodies } = await import('./plugins/atom-bodies.js');
+          const { renderActiveStageBlock } = await import('@open-design/contracts');
+          const blocks = [];
+          for (const stage of stages) {
+            const bodies = await loadAtomBodies(db, stage.atoms ?? []);
+            const block = renderActiveStageBlock({ stageId: stage.id, bodies });
+            if (block.trim().length > 0) blocks.push(block);
+          }
+          if (blocks.length > 0) activeStageBlocks = blocks;
+        }
+      } catch (err) {
+        console.warn(`[plugins] activeStageBlocks build failed: ${(err)?.message ?? err}`);
+      }
+    }
+
     const prompt = composeSystemPrompt({
       agentId,
       includeCodexImagegenOverride: false,
@@ -5487,16 +8610,39 @@ export async function startServer({
       skillMode,
       designSystemBody,
       designSystemTitle,
+      designSystemUsageMd,
+      designSystemTokensCss,
+      designSystemComponentsManifest,
+      designSystemFixtureHtml,
+      designSystemPullIndex,
+      designSystemImportMode,
       craftBody,
       craftSections,
+      memoryBody,
       metadata,
       template,
-      critique: critiqueShouldRun ? critiqueCfg : undefined,
+      audioVoiceOptions,
+      audioVoiceOptionsError,
+      // critiqueCfg.enabled is loaded from OD_CRITIQUE_ENABLED only, so a
+      // run that the resolver enabled via phase / project / skill (env
+      // unset) would have critiqueShouldRun = true while critiqueCfg.enabled
+      // remains false. Without this override the composer's own gate
+      // (cfg.enabled) drops the panel addendum, the orchestrator still
+      // launches, and the parser waits for <CRITIQUE_RUN> tags the model
+      // was never told to emit (codex P2 on PR #1338). Build a derived
+      // config that pins enabled to the resolver decision so the composer
+      // and the orchestrator agree on every eligibility input.
+      critique: critiqueShouldRun ? { ...critiqueCfg, enabled: true } : undefined,
       critiqueBrand: critiqueShouldRun ? critiqueBrand : undefined,
       critiqueSkill: critiqueShouldRun ? critiqueSkill : undefined,
+      streamFormat,
       connectedExternalMcp: Array.isArray(connectedExternalMcp)
         ? connectedExternalMcp
         : undefined,
+      ...(pluginBlock ? { pluginBlock } : {}),
+      ...(activeStageBlocks ? { activeStageBlocks } : {}),
+      userInstructions,
+      projectInstructions,
     });
     // The chat handler also needs to know where the active skill lives
     // on disk so it can stage a per-project copy of its side files
@@ -5505,6 +8651,79 @@ export async function startServer({
     // the same panel-eligibility decision down to the spawn-path
     // orchestrator gate so prompt and orchestrator stay in lockstep.
     return { prompt, activeSkillDir, critiqueShouldRun };
+  };
+
+  // Plan §3.I1 / §3.D / spec §10.1: fire the pipeline schedule on a
+  // run's SSE stream. Synchronous first emit (the first
+  // pipeline_stage_started event lands before the agent process
+  // starts) + async tail. Stage D wires the atom-worker registry as
+  // the default stage runner; set OD_PIPELINE_RUNNER=stub to fall
+  // back to the canned v1 stub for diagnostic bisection or replay
+  // of pre-Stage-D runs. Errors are swallowed (logged) so a bad
+  // pipeline never blocks the agent run.
+  const firePipelineForRun = (args) => {
+    const { run, snapshot, runs, db: dbHandle } = args;
+    if (!snapshot?.pipeline?.stages?.length) return;
+    const env = { maxIterations: readPluginEnvKnobs().maxDevloopIterations };
+    const emitPipeline = (evt) => {
+      try { runs.emit(run, evt.kind, evt); } catch {/* ignore */}
+    };
+    const emitGenui = (evt) => {
+      try { runs.emit(run, evt.kind, evt); } catch {/* ignore */}
+    };
+    const projectIdForRun = run.projectId
+      ?? snapshot.resolvedContext?.items?.[0]?.id
+      ?? 'project-unknown';
+    const runnerMode = process.env.OD_PIPELINE_RUNNER === 'stub'
+      ? 'stub'
+      : 'registry';
+    let runStage;
+    if (runnerMode === 'stub') {
+      runStage = ({ iteration }) => ({
+        signals: {
+          'critique.score':  iteration >= 0 ? 4 : 0,
+          'preview.ok':      true,
+          'user.confirmed':  true,
+        },
+      });
+    } else {
+      registerBuiltInAtomWorkers();
+      runStage = async ({ stage, iteration, snapshot: stageSnapshot }) => {
+        const outcome = await runStageWithRegistry({
+          db:             dbHandle,
+          runId:          run.id,
+          projectId:      projectIdForRun,
+          conversationId: run.conversationId ?? null,
+          stage,
+          iteration,
+          snapshot:       stageSnapshot,
+        });
+        return {
+          signals:         outcome.signals,
+          critiqueSummary: outcome.critiqueSummary,
+        };
+      };
+    }
+    void runPipelineForRun({
+      db: dbHandle,
+      runId:           run.id,
+      projectId:       projectIdForRun,
+      conversationId:  run.conversationId ?? null,
+      snapshot,
+      pipeline:        snapshot.pipeline,
+      env,
+      runStage,
+      emitPipeline,
+      emitGenui,
+    }).catch((err) => {
+      try {
+        runs.emit(run, 'pipeline_stage_failed', {
+          runId:      run.id,
+          snapshotId: snapshot.snapshotId,
+          message:    String(err?.message ?? err),
+        });
+      } catch { /* ignore */ }
+    });
   };
 
   const startChatRun = async (chatBody, run) => {
@@ -5527,6 +8746,7 @@ export async function startServer({
       model,
       reasoning,
       research,
+      context,
     } = chatBody;
     if (typeof projectId === 'string' && projectId) run.projectId = projectId;
     if (typeof conversationId === 'string' && conversationId)
@@ -5567,6 +8787,21 @@ export async function startServer({
     if (run.cancelRequested || design.runs.isTerminal(run.status)) return;
     const runId = run.id;
 
+    // Auto-memory hook. Pulls explicit "remember:" / "我是 X" / "I prefer Y"
+    // markers out of the just-arrived user message and writes them as MD
+    // files under <dataDir>/memory/. We await so the very next
+    // composeSystemPrompt() call (a few lines below) re-reads memory from
+    // disk and a marker inside this turn's message is reflected in this
+    // turn's prompt. Failures are swallowed — memory is best-effort and
+    // must never block the agent run.
+    if (typeof message === 'string' && message.trim().length > 0) {
+      try {
+        await extractFromMessage(RUNTIME_DATA_DIR, message);
+      } catch (err) {
+        console.warn('[memory] extractFromMessage failed', err);
+      }
+    }
+
     // Resolve the project working directory (creating the folder if it
     // doesn't exist yet). Without one we don't pass cwd to spawn — the
     // agent then runs in whatever inherited dir, which still lets API
@@ -5606,19 +8841,7 @@ export async function startServer({
     // explicit list at the bottom of the user message so the agent knows
     // to Read it.
     const safeAttachments = cwd
-      ? (Array.isArray(attachments) ? attachments : [])
-          .filter((p) => typeof p === 'string' && p.length > 0)
-          .filter((p) => {
-            try {
-              const abs = path.resolve(cwd, p);
-              return (
-                (abs === cwd || abs.startsWith(cwd + path.sep)) &&
-                fs.existsSync(abs)
-              );
-            } catch {
-              return false;
-            }
-          })
+      ? resolveSafeProjectAttachments(cwd, attachments)
       : [];
 
     // Local code agents don't accept a separate "system" channel the way the
@@ -5638,6 +8861,7 @@ export async function startServer({
       typeof projectId === 'string' && projectId
         ? getProject(db, projectId)
         : null;
+    const runContextPrompt = renderRunContextPrompt(context, projectRecord?.metadata);
     const linkedDirs = (() => {
       if (!Array.isArray(projectRecord?.metadata?.linkedDirs)) return [];
       const v = validateLinkedDirs(projectRecord.metadata.linkedDirs);
@@ -5654,12 +8878,28 @@ export async function startServer({
     const attachmentHint = safeAttachments.length
       ? `\n\nAttached project files: ${safeAttachments.map((p) => `\`${p}\``).join(', ')}`
       : '';
+    // Plan §3.A3 / spec §9: thread plugin context onto every tool token
+    // so the connector execute route can re-validate the §5.3
+    // capability gate without re-reading the SQLite snapshot row.
+    let pluginGrantContext = null;
+    if (cwd && typeof projectId === 'string' && projectId && run?.appliedPluginSnapshotId) {
+      const snap = getSnapshot(db, run.appliedPluginSnapshotId);
+      if (snap) {
+        const installed = getInstalledPlugin(db, snap.pluginId);
+        pluginGrantContext = {
+          pluginSnapshotId: snap.snapshotId,
+          pluginTrust: installed?.trust ?? 'restricted',
+          pluginCapabilitiesGranted: snap.capabilitiesGranted ?? [],
+        };
+      }
+    }
     const toolTokenGrant = cwd && typeof projectId === 'string' && projectId
       ? toolTokenRegistry.mint({
           runId,
           projectId,
           allowedEndpoints: CHAT_TOOL_ENDPOINTS,
           allowedOperations: CHAT_TOOL_OPERATIONS,
+          ...(pluginGrantContext ?? {}),
         })
       : null;
     let toolTokenRevoked = false;
@@ -5742,6 +8982,10 @@ export async function startServer({
         designSystemId,
         streamFormat: def?.streamFormat ?? 'plain',
         connectedExternalMcp,
+        // Plan §3.M2 / §3.V1 — forward the run's snapshot id so the
+        // prompt composer can splice in `## Active stage` blocks.
+        // Default ON; set OD_BUNDLED_ATOM_PROMPTS=0 to opt out.
+        appliedPluginSnapshotId: run?.appliedPluginSnapshotId ?? null,
       });
 
     // Make skill side files reachable through three layers, in order of
@@ -5821,7 +9065,7 @@ export async function startServer({
       research,
       message,
     );
-    const clientInstructionPrompt = [researchCommandContract, systemPrompt]
+    const clientInstructionPrompt = [researchCommandContract, runContextPrompt, systemPrompt]
       .map((part) => (typeof part === 'string' ? part.trim() : ''))
       .filter(Boolean)
       .join('\n\n---\n\n');
@@ -5968,7 +9212,8 @@ export async function startServer({
       configuredAgentEnv = {};
     }
 
-    const resolvedBin = resolveAgentBin(agentId, configuredAgentEnv);
+    const agentLaunch = resolveAgentLaunch(def, configuredAgentEnv);
+    const resolvedBin = agentLaunch.selectedPath;
 
     const args = def.buildArgs(
       composed,
@@ -5990,7 +9235,7 @@ export async function startServer({
     // doesn't have to special-case it.
     const cmdShimBudgetError = checkWindowsCmdShimCommandLineBudget(
       def,
-      resolvedBin,
+      agentLaunch.launchPath ?? resolvedBin,
       args,
     );
     if (cmdShimBudgetError) {
@@ -6017,7 +9262,7 @@ export async function startServer({
     // users hit a generic `spawn ENAMETOOLONG`.
     const directExeBudgetError = checkWindowsDirectExeCommandLineBudget(
       def,
-      resolvedBin,
+      agentLaunch.launchPath ?? resolvedBin,
       args,
     );
     if (directExeBudgetError) {
@@ -6037,6 +9282,26 @@ export async function startServer({
     const inactivityTimeoutMs = resolveChatRunInactivityTimeoutMs();
     const inactivityKillGraceMs = 3_000;
     let inactivityTimer = null;
+    let childStdoutSeen = false;
+    let lastAgentEventPhase = 'spawn pending';
+    let lastToolResultChars = 0;
+    const summarizeAgentEventForInactivity = (payload) => {
+      const type = payload?.type ? String(payload.type) : 'unknown';
+      if (type === 'tool_result') {
+        const content = typeof payload.content === 'string' ? payload.content : '';
+        lastToolResultChars = Math.max(lastToolResultChars, content.length);
+        return `tool_result:${content.length} chars`;
+      }
+      if (type === 'tool_use') {
+        const name = payload?.name ? String(payload.name) : 'unknown';
+        return `tool_use:${name}`;
+      }
+      if (type === 'text_delta' || type === 'thinking_delta') {
+        const text = typeof payload.text === 'string' ? payload.text : '';
+        return `${type}:${text.length} chars`;
+      }
+      return type;
+    };
     const clearInactivityWatchdog = () => {
       if (inactivityTimer) {
         clearTimeout(inactivityTimer);
@@ -6056,7 +9321,10 @@ export async function startServer({
       if (run.cancelRequested || design.runs.isTerminal(run.status)) return;
       const message =
         `Agent stalled without emitting any new output for ${Math.round(inactivityTimeoutMs / 1000)}s. ` +
-        'The model or CLI likely hung while generating. Retry the turn or pick a different model.';
+        'The model or CLI likely hung while generating. ' +
+        `Phase details: spawned agent binary ${resolvedBin}; stdout arrived: ${childStdoutSeen ? 'yes' : 'no'}; ` +
+        `last agent event: ${lastAgentEventPhase}; largest tool result observed: ${lastToolResultChars} chars. ` +
+        'Retry the turn, pick a different model, or start a new conversation if the prior context is very large.';
       clearInactivityWatchdog();
       send('error', createSseErrorPayload('AGENT_EXECUTION_FAILED', message, { retryable: true }));
       design.runs.finish(run, 'failed', 1, null);
@@ -6076,15 +9344,17 @@ export async function startServer({
       activeChatAgentEventSinks.delete(toolTokenGrant?.runId ?? runId);
     };
     if (toolTokenGrant?.runId) {
-      activeChatAgentEventSinks.set(toolTokenGrant.runId, (payload) =>
-        (noteAgentActivity(), send('agent', payload)),
-      );
+      activeChatAgentEventSinks.set(toolTokenGrant.runId, (payload) => {
+        lastAgentEventPhase = summarizeAgentEventForInactivity(payload);
+        noteAgentActivity();
+        send('agent', payload);
+      });
     }
     // If detection can't find the binary, surface a friendly SSE error
     // pointing at /api/agents instead of silently falling back to
     // spawn(def.bin) — that fallback re-introduces the exact ENOENT symptom
     // from issue #10.
-    if (!resolvedBin) {
+    if (!resolvedBin || !agentLaunch.launchPath) {
       revokeToolToken('child_exit');
       unregisterChatAgentEventSink();
       send('error', createSseErrorPayload(
@@ -6130,6 +9400,9 @@ export async function startServer({
     let child;
     let acpSession = null;
     let writePromptToChildStdin = false;
+    let spawnedAgentEnv = null;
+    let agentStdoutTail = '';
+    let agentStderrTail = '';
     try {
       // Prompt delivery via stdin is now the universal default. This bypasses
       // both the cmd.exe 8KB limit and the CreateProcess 32KB limit.
@@ -6137,7 +9410,7 @@ export async function startServer({
         def.promptViaStdin || def.streamFormat === 'acp-json-rpc'
           ? 'pipe'
           : 'ignore';
-      const env = {
+      const env = applyAgentLaunchEnv({
         ...spawnEnvForAgent(
           def.id,
           {
@@ -6147,9 +9420,10 @@ export async function startServer({
           configuredAgentEnv,
         ),
         ...odMediaEnv,
-      };
+      }, agentLaunch);
+      spawnedAgentEnv = env;
       const invocation = createCommandInvocation({
-        command: resolvedBin,
+        command: agentLaunch.launchPath,
         args,
         env,
       });
@@ -6170,7 +9444,12 @@ export async function startServer({
         // crash the daemon. Swallow it — the regular exit/close handlers
         // below already route the underlying failure to SSE via stderr.
         child.stdin.on('error', (err) => {
-          if (err.code !== 'EPIPE') {
+          // EPIPE = Unix broken-pipe when child closes its stdin read end
+          // early. 'write EOF' (err.code 'EOF') = Windows equivalent of
+          // the same condition via UV_EOF. Both mean the child exited before
+          // reading stdin — the process exit/close handlers already route
+          // the underlying failure to SSE via stderr, so swallow these here.
+          if (err.code !== 'EPIPE' && err.code !== 'EOF' && err.message !== 'write EOF') {
             send(
               'error',
               createSseErrorPayload(
@@ -6197,7 +9476,50 @@ export async function startServer({
     // structured adapters that buffer partial lines (Codex item.completed,
     // pi-rpc session/prompt, ACP agent messages) and models that spend a
     // long time in non-streamed reasoning still keep the run alive.
-    child.stdout.on('data', () => noteAgentActivity());
+    child.stdout.on('data', (chunk) => {
+      childStdoutSeen = true;
+      noteAgentActivity();
+      agentStdoutTail = `${agentStdoutTail}${chunk}`.slice(-2000);
+    });
+
+    // ---- Memory: assistant-reply buffer for LLM extraction --------------
+    // Capture up to 32 KiB of raw stdout. The LLM extractor (fired in the
+    // close handler) trims further; we only need enough to ground the
+    // model. Multiple `on('data')` listeners coexist — the wrapper-stream
+    // handlers below also subscribe and that's fine.
+    const MEMORY_BUFFER_CAP = 32 * 1024;
+    let memoryAssistantBuffer = '';
+    child.stdout.on('data', (chunk) => {
+      if (memoryAssistantBuffer.length >= MEMORY_BUFFER_CAP) return;
+      memoryAssistantBuffer += String(chunk);
+      if (memoryAssistantBuffer.length > MEMORY_BUFFER_CAP) {
+        memoryAssistantBuffer = memoryAssistantBuffer.slice(0, MEMORY_BUFFER_CAP);
+      }
+    });
+    child.on('close', () => {
+      const captured = memoryAssistantBuffer;
+      const userMsg = typeof message === 'string' ? message : '';
+      // Forward the chat agent id so memory-llm.pickProvider can
+      // constrain its auto-pick to the chat protocol's family — keeps
+      // a Claude Code (anthropic) chat from triggering OpenAI/gpt-4o-
+      // mini extraction in the background just because the user has
+      // an OpenAI key parked in media-config.
+      void import('./memory-llm.js')
+        .then(({ extractWithLLM }) =>
+          extractWithLLM(
+            RUNTIME_DATA_DIR,
+            {
+              userMessage: userMsg,
+              assistantMessage: captured,
+            },
+            {
+              projectRoot: PROJECT_ROOT,
+              chatAgentId: typeof agentId === 'string' ? agentId : null,
+            },
+          ),
+        )
+        .catch((err) => console.warn('[memory-llm] background failed', err));
+    });
 
     // Critique Theater branch (M0 dark launch, default disabled).
     // Only plain-stream adapters are routed through runOrchestrator in v1.
@@ -6208,12 +9530,13 @@ export async function startServer({
     // stderr warning so the parser never sees wrapper bytes. Per-format
     // decoding into the orchestrator is a v2 concern.
     //
-    // Use critiqueShouldRun (computed in the prompt builder) instead of just
-    // critiqueCfg.enabled so the orchestrator gate is in lockstep with the
-    // panel addendum. Media surfaces and runs missing brand/skill context
-    // never get the panel prompt, so they must also skip the orchestrator
-    // and fall through to legacy generation; otherwise the parser waits for
-    // <CRITIQUE_RUN> tags the model was never told to emit.
+    // Use critiqueShouldRun (computed in the prompt builder) instead of
+    // just the env var or the rollout resolver so the orchestrator gate
+    // is in lockstep with the panel addendum. Media surfaces and runs
+    // missing brand/skill context never get the panel prompt, so they
+    // must also skip the orchestrator and fall through to legacy
+    // generation; otherwise the parser waits for <CRITIQUE_RUN> tags
+    // the model was never told to emit.
     if (critiqueShouldRun) {
       const adapterStreamFormat: string = def.streamFormat ?? 'plain';
       if (adapterStreamFormat !== 'plain') {
@@ -6236,7 +9559,43 @@ export async function startServer({
         // than wrapping the frame inside the legacy 'agent' channel. Clients
         // that subscribe to the new event names see them directly with the
         // contract payload as event.data.
-        const critiqueBus = { emit: (e) => send(e.event, e.data) };
+        //
+        // Critique events go to TWO sinks (codex P1 on PR #1338):
+        //
+        //   1. `design.runs.emit(...)` via `send(...)`, which fans out on
+        //      `/api/runs/:runId/events`. Existing transport, unchanged.
+        //   2. The per-project event-sinks map, which fans out on
+        //      `/api/projects/:projectId/events`. This is the transport the
+        //      web `CritiqueTheaterMount` actually subscribes to (the mount
+        //      is project-scoped, not run-scoped, because it lives at the
+        //      project workspace level and follows the user across runs).
+        //      Without this second sink the mount sees no frames in
+        //      production and only the e2e tests' stubbed routes deliver
+        //      anything to the reducer.
+        //
+        // The project-events route emits via `sse.send(payload.type,
+        // payload)`, so we pack the SSE channel name onto `payload.type`
+        // and let the sink push the right channel name. The web's
+        // `sseToPanelEvent` overwrites `type` from the channel name on the
+        // way back into a PanelEvent, so this round-trip stays correct.
+        const critiqueProjectIdForBus =
+          typeof projectId === 'string' && projectId ? projectId : null;
+        const critiqueBus = {
+          emit: (e) => {
+            // Two transports for every critique event: the run-scoped
+            // SSE send back to the originating chat run, plus the
+            // project-scoped fan-out so the Theater mount (subscribed
+            // to /api/projects/:id/events) sees it too. Route the
+            // project fan-out through emitProjectEvent so empty-sink
+            // cleanup and any future broadcast policy (rate limiting,
+            // schema validation, telemetry) apply uniformly across
+            // every project emitter (PerishCode P3 on PR #1338).
+            send(e.event, e.data);
+            if (critiqueProjectIdForBus) {
+              emitProjectEvent(critiqueProjectIdForBus, { ...e.data, type: e.event });
+            }
+          },
+        };
 
         // Register this run with the in-process registry so the interrupt
         // endpoint can cascade an AbortController to the orchestrator. The
@@ -6280,6 +9639,16 @@ export async function startServer({
             artifactId: critiqueRunId,
             artifactDir: critiqueArtifactDir,
             adapter: typeof agentId === 'string' ? agentId : 'unknown',
+            // Codex P2 on PR #1485: thread the resolved skill id into the
+            // orchestrator so the Phase 12 metrics carry the real label
+            // instead of falling through to 'unknown' for every live run.
+            // `effectiveSkillId` was already computed above (line ~2951) as
+            // the request skillId with a project-row fallback; pass it
+            // through verbatim, and leave the orchestrator's own default
+            // of 'unknown' for runs that genuinely have no skill assigned.
+            skill: typeof effectiveSkillId === 'string' && effectiveSkillId
+              ? effectiveSkillId
+              : undefined,
             cfg: critiqueCfg,
             db,
             bus: critiqueBus,
@@ -6342,12 +9711,30 @@ export async function startServer({
         if (agentStreamError) return;
         agentStreamError = String(ev.message || 'Agent stream error');
         clearInactivityWatchdog();
+        const authFailure = classifyAgentAuthFailure(
+          agentId,
+          [
+            agentStreamError,
+            typeof ev.raw === 'string' ? ev.raw : '',
+            agentStdoutTail,
+            agentStderrTail,
+          ].join('\n'),
+        );
+        if (authFailure?.status === 'missing') {
+          send('error', createSseErrorPayload(
+            'AGENT_AUTH_REQUIRED',
+            authFailure.message ?? cursorAuthGuidance(),
+            { retryable: true },
+          ));
+          return;
+        }
         send('error', createSseErrorPayload('AGENT_EXECUTION_FAILED', agentStreamError, {
           details: ev.raw ? { raw: ev.raw } : undefined,
           retryable: false,
         }));
         return;
       }
+      lastAgentEventPhase = summarizeAgentEventForInactivity(ev);
       noteAgentActivity();
       if (ev?.type && SUBSTANTIVE_AGENT_EVENT_TYPES.has(ev.type)) {
         agentProducedOutput = true;
@@ -6357,8 +9744,56 @@ export async function startServer({
 
     if (def.streamFormat === 'claude-stream-json') {
       const claude = createClaudeStreamHandler((ev) => {
+        lastAgentEventPhase = summarizeAgentEventForInactivity(ev);
         noteAgentActivity();
         send('agent', ev);
+        // Stream-json input mode keeps the child's stdin open across the
+        // turn so we can answer interactive tools like `AskUserQuestion`
+        // with a real `tool_result`. The child has no other way to know
+        // the conversation is over, though — without an EOF it sits idle
+        // until the inactivity watchdog kills it. Bookkeeping here:
+        //   - tool_use(AskUserQuestion): record the id so we know we owe
+        //     the model a tool_result before the turn can end.
+        //   - turn_end (per-turn synthesized from `stop_reason`): fire on
+        //     `end_turn` etc. but NOT on `tool_use` — that stop reason
+        //     means the model paused mid-tool, not "turn complete".
+        //   - usage (session result at EOF in single-shot mode).
+        try {
+          if (run.stdinOpen) {
+            if (
+              ev &&
+              typeof ev === 'object' &&
+              ev.type === 'tool_use' &&
+              (ev.name === 'AskUserQuestion' || ev.name === 'ask_user_question') &&
+              typeof ev.id === 'string'
+            ) {
+              if (!run.pendingHostAnswers) run.pendingHostAnswers = new Set();
+              run.pendingHostAnswers.add(ev.id);
+            } else if (
+              ev &&
+              typeof ev === 'object' &&
+              ((ev.type === 'turn_end' &&
+                // `stop_reason: tool_use` means the model paused to wait
+                // for tool execution (claude-code is about to run an
+                // internal tool, or we owe a host tool_result). Either
+                // way the conversation is still in flight — do not close.
+                ev.stopReason !== 'tool_use') ||
+                ev.type === 'usage') &&
+              (!run.pendingHostAnswers || run.pendingHostAnswers.size === 0)
+            ) {
+              // Per-turn `turn_end` (synthesized from
+              // `assistant.message.stop_reason` in `claude-stream`) is the
+              // primary close signal; `usage` is the session-level result
+              // that fires at EOF in single-shot mode. Either is a valid
+              // "this turn is done" cue, but only when there's no host
+              // answer outstanding AND the model isn't paused mid-tool.
+              if (run.child && run.child.stdin && !run.child.stdin.destroyed) {
+                try { run.child.stdin.end(); } catch {}
+              }
+              run.stdinOpen = false;
+            }
+          }
+        } catch {}
       });
       child.stdout.on('data', (chunk) => claude.feed(chunk));
       child.on('close', () => claude.flush());
@@ -6369,6 +9804,7 @@ export async function startServer({
       child.on('close', () => qoder.flush());
     } else if (def.streamFormat === 'copilot-stream-json') {
       const copilot = createCopilotStreamHandler((ev) => {
+        lastAgentEventPhase = summarizeAgentEventForInactivity(ev);
         noteAgentActivity();
         send('agent', ev);
       });
@@ -6417,6 +9853,7 @@ export async function startServer({
         uploadRoot: UPLOAD_DIR,
       });
     } else if (def.streamFormat === 'acp-json-rpc') {
+      const acpStageTimeoutMs = resolveAcpStageTimeoutMs();
       acpSession = attachAcpSession({
         child,
         prompt: composed,
@@ -6427,6 +9864,7 @@ export async function startServer({
           noteAgentActivity();
           send(event, data);
         },
+        ...(acpStageTimeoutMs !== undefined ? { stageTimeoutMs: acpStageTimeoutMs } : {}),
       });
     } else if (def.streamFormat === 'json-event-stream') {
       // Pipe through sendAgentEvent so the OpenCode `type:'error'` frame
@@ -6452,6 +9890,7 @@ export async function startServer({
     run.acpSession = acpSession;
     child.stderr.on('data', (chunk) => {
       noteAgentActivity();
+      agentStderrTail = `${agentStderrTail}${chunk}`.slice(-2000);
       send('stderr', { chunk });
     });
 
@@ -6471,6 +9910,23 @@ export async function startServer({
       }
       if (agentStreamError) {
         return design.runs.finish(run, 'failed', code ?? 1, signal ?? null);
+      }
+      if (
+        code !== 0 &&
+        !run.cancelRequested
+      ) {
+        const authFailure = classifyAgentAuthFailure(
+          agentId,
+          `${agentStderrTail}\n${agentStdoutTail}`,
+        );
+        if (authFailure?.status === 'missing') {
+          send('error', createSseErrorPayload(
+            'AGENT_AUTH_REQUIRED',
+            authFailure.message ?? cursorAuthGuidance(),
+            { retryable: true },
+          ));
+          return design.runs.finish(run, 'failed', code ?? 1, signal ?? null);
+        }
       }
       // Empty-output guard: a clean `code === 0` exit on a stream we are
       // tracking, with no error frame and no substantive event, means the
@@ -6494,16 +9950,129 @@ export async function startServer({
         ));
         return design.runs.finish(run, 'failed', code, signal);
       }
+      // ACP agents that don't shut down on stdin.end() (e.g. Devin for
+      // Terminal) are forced to exit via SIGTERM from attachAcpSession after
+      // a clean prompt completion. Without an override, the chat run would
+      // be marked `failed` because `code === 0` fails (code is null on a
+      // signal exit). `completedSuccessfully()` reports whether the ACP
+      // session resolved without a fatal error or abort.
+      //
+      // Scope the override narrowly to the exact forced-shutdown shape this
+      // PR introduces: code is null AND signal is SIGTERM AND the ACP
+      // session reported clean completion. Any other post-response failure
+      // (non-zero exit code, SIGKILL, SIGSEGV, etc.) still propagates as
+      // `failed`, preserving the existing close-status behavior for genuine
+      // post-response process problems.
+      const acpCleanCompletion =
+        typeof acpSession?.completedSuccessfully === 'function' &&
+        acpSession.completedSuccessfully();
+      const acpForcedShutdown =
+        code === null && signal === 'SIGTERM' && acpCleanCompletion;
       const status = run.cancelRequested
         ? 'canceled'
-        : code === 0
+        : code === 0 || acpForcedShutdown
           ? 'succeeded'
           : 'failed';
+      if (status === 'failed') {
+        const diagnostic = diagnoseClaudeCliFailure({
+          agentId: def.id,
+          exitCode: code,
+          signal,
+          stderrTail: agentStderrTail,
+          stdoutTail: agentStdoutTail,
+          env: spawnedAgentEnv,
+        });
+        if (diagnostic) {
+          send('error', createSseErrorPayload(
+            'AGENT_EXECUTION_FAILED',
+            diagnostic.message,
+            { retryable: diagnostic.retryable, details: { detail: diagnostic.detail } },
+          ));
+        }
+      }
       design.runs.finish(run, status, code, signal);
     });
     if (writePromptToChildStdin && child.stdin) {
-      child.stdin.end(composed, 'utf8');
+      const promptInputFormat = def.promptInputFormat ?? 'text';
+      if (promptInputFormat === 'stream-json') {
+        // Wrap the prompt as an Anthropic user message and write it as one
+        // JSONL line. Do NOT close stdin: claude-code keeps reading further
+        // messages until EOF, which is what lets us inject a `tool_result`
+        // block later when the user answers an `AskUserQuestion` card. The
+        // stdin is closed implicitly when the child exits (run terminates,
+        // user cancels, or the model finishes without an outstanding tool
+        // call).
+        const userMessage = JSON.stringify({
+          type: 'user',
+          message: {
+            role: 'user',
+            content: [{ type: 'text', text: composed }],
+          },
+        });
+        try {
+          child.stdin.write(`${userMessage}\n`, 'utf8');
+        } catch (err) {
+          // Swallow EPIPE here for the same reason as the listener above —
+          // a fast-exiting child has already routed its failure through
+          // stderr / exit handlers.
+          if (err && err.code !== 'EPIPE') throw err;
+        }
+        run.stdinOpen = true;
+      } else {
+        child.stdin.end(composed, 'utf8');
+      }
     }
+  };
+
+  // Send a `tool_result` content block into a still-running stream-json
+  // child. Used for interactive tools that the host answers (currently:
+  // Claude's `AskUserQuestion`). The run must still be active and its
+  // stdin must still be open — we never re-spawn a closed child.
+  const submitToolResultToRun = (runId, toolUseId, content, isError = false) => {
+    const run = design.runs.get(runId);
+    if (!run) return { ok: false, reason: 'not_found' };
+    if (design.runs.isTerminal(run.status)) {
+      return { ok: false, reason: 'run_terminal' };
+    }
+    if (!run.child || !run.child.stdin || run.child.stdin.destroyed) {
+      return { ok: false, reason: 'stdin_closed' };
+    }
+    if (!run.stdinOpen) {
+      return { ok: false, reason: 'stdin_text_mode' };
+    }
+    if (typeof toolUseId !== 'string' || !toolUseId) {
+      return { ok: false, reason: 'bad_tool_use_id' };
+    }
+    const safeContent = typeof content === 'string' ? content : String(content ?? '');
+    const userMessage = JSON.stringify({
+      type: 'user',
+      message: {
+        role: 'user',
+        content: [
+          {
+            type: 'tool_result',
+            tool_use_id: toolUseId,
+            content: safeContent,
+            is_error: !!isError,
+          },
+        ],
+      },
+    });
+    try {
+      run.child.stdin.write(`${userMessage}\n`, 'utf8');
+    } catch (err) {
+      return { ok: false, reason: 'write_failed', error: err && err.message };
+    }
+    if (run.pendingHostAnswers) {
+      run.pendingHostAnswers.delete(toolUseId);
+      if (run.pendingHostAnswers.size === 0 && run.stdinOpen) {
+        if (run.child && run.child.stdin && !run.child.stdin.destroyed) {
+          try { run.child.stdin.end(); } catch {}
+        }
+        run.stdinOpen = false;
+      }
+    }
+    return { ok: true };
   };
 
   orbitService.setRunHandler(async ({
@@ -6634,7 +10203,9 @@ export async function startServer({
         ...(artifact?.id ? { artifactId: artifact.id, artifactProjectId: projectId } : {}),
         summary: artifact?.id
           ? `Agent ${finalStatus.status} and registered live artifact ${artifact.title}.`
-          : `Agent ${finalStatus.status} but did not register a live artifact for this Orbit run.`,
+          : finalStatus.status === 'succeeded'
+            ? buildOrbitNoLiveArtifactSummary(run.events)
+            : `Agent ${finalStatus.status} but did not register a live artifact for this Orbit run.`,
       };
     })();
 
@@ -6642,7 +10213,11 @@ export async function startServer({
   });
 
   orbitService.setTemplateResolver(async (skillId) => {
-    const skills = await listAllSkills();
+    // Orbit templates (live-artifact, etc.) live under design-templates after
+    // the split, but earlier projects may still point at functional-skill
+    // ids for the same purpose — search both roots so a stored project id
+    // keeps resolving through one or the other.
+    const skills = await listAllSkillLikeEntries();
     const skill = findSkillById(skills, skillId);
     if (!skill || skill.scenario !== 'orbit') return null;
     return {
@@ -6655,25 +10230,121 @@ export async function startServer({
     };
   });
 
-  app.post('/api/runs', (req, res) => {
+  app.post('/api/runs', async (req, res) => {
     if (daemonShuttingDown) {
       return sendApiError(res, 503, 'UPSTREAM_UNAVAILABLE', 'daemon is shutting down');
     }
-    const run = design.runs.create(req.body || {});
-    // Capture which front-end carrier started the run (Electron desktop
-    // shell vs. plain browser). Web sets this header explicitly; falls
-    // back to a UA sniff if header is absent. Used as a telemetry tag.
-    const declared = String(req.get('x-od-client') ?? '').toLowerCase();
-    if (declared === 'desktop' || declared === 'web') {
-      run.clientType = declared;
-    } else {
-      const ua = String(req.get('user-agent') ?? '');
-      run.clientType = ua.includes('Electron/') ? 'desktop' : 'web';
+    // Plan §3.A1 / spec §11.5: resolve any pluginId / appliedPluginSnapshotId
+    // before the run is created. The resolver returns null when the body
+    // does not mention a plugin (legacy runs unchanged), an error envelope
+    // for missing-input / capability / not-found / stale, or an ok result
+    // whose `snapshotId` is pinned onto the run object so downstream
+    // code (system prompt block, tool tokens, replay) can reach it.
+    //
+    // Stage A of plugin-driven-flow-plan: when neither the body nor the
+    // project carries plugin info we fall back to the bundled scenario
+    // plugin for the project's `metadata.kind` so direct callers (CLI /
+    // SDK / agent-headless runs) get the same auto-binding the web
+    // create flow already produces. The fallback is silent — a bundled
+    // scenario that is not installed leaves the run plugin-less, which
+    // matches the legacy path.
+    let resolvedSnapshot = null;
+    if (typeof req.body?.projectId === 'string' && req.body.projectId) {
+      let registryView;
+      try {
+        registryView = await loadPluginRegistryView();
+      } catch (err) {
+        return res.status(500).json({ error: String(err) });
+      }
+      const explicitPlugin =
+        req.body && (req.body.pluginId || req.body.appliedPluginSnapshotId);
+      let runResolveBody = req.body;
+      if (!explicitPlugin) {
+        const projectRow = getProject(db, req.body.projectId);
+        const hasPin =
+          typeof projectRow?.appliedPluginSnapshotId === 'string'
+          && projectRow.appliedPluginSnapshotId.length > 0;
+        if (!hasPin) {
+          const fallbackPluginId = defaultScenarioPluginIdForKind(
+            projectRow?.metadata?.kind,
+          );
+          if (fallbackPluginId && getInstalledPlugin(db, fallbackPluginId)) {
+            runResolveBody = { ...req.body, pluginId: fallbackPluginId };
+          }
+        }
+      }
+      const resolved = resolvePluginSnapshot({
+        db,
+        body: runResolveBody,
+        projectId: req.body.projectId,
+        conversationId: typeof req.body.conversationId === 'string'
+          ? req.body.conversationId
+          : null,
+        registry: registryView,
+      });
+      if (resolved && !resolved.ok) {
+        if (!explicitPlugin) {
+          console.warn(
+            `[plugins] default-scenario fallback skipped for run on project ${req.body.projectId}: ${resolved.body?.error?.code ?? 'unknown'}`,
+          );
+        } else {
+          return res.status(resolved.status).json(resolved.body);
+        }
+      } else {
+        resolvedSnapshot = resolved;
+      }
+    }
+    const meta = { ...(req.body || {}) };
+    if (resolvedSnapshot?.ok) {
+      meta.appliedPluginSnapshotId = resolvedSnapshot.snapshotId;
+      if (!meta.pluginId) meta.pluginId = resolvedSnapshot.snapshot.pluginId;
+      if (typeof meta.message !== 'string' || meta.message.trim().length === 0) {
+        const renderedQuery = renderPluginBriefTemplate(
+          resolvedSnapshot.snapshot.query,
+          resolvedSnapshot.snapshot.inputs,
+        ).trim();
+        if (renderedQuery.length > 0) meta.message = renderedQuery;
+      }
+    }
+    const run = design.runs.create(meta);
+    if (resolvedSnapshot?.ok) {
+      try {
+        const { linkSnapshotToRun } = await import('./plugins/snapshots.js');
+        linkSnapshotToRun(db, resolvedSnapshot.snapshotId, run.id);
+      } catch {
+        // Linking is best-effort here; in-memory run still carries the id.
+      }
     }
     /** @type {import('@open-design/contracts').ChatRunCreateResponse} */
-    const body = { runId: run.id };
+    const body = {
+      runId: run.id,
+      ...(resolvedSnapshot?.ok
+        ? {
+            appliedPluginSnapshotId: resolvedSnapshot.snapshotId,
+            pluginId: resolvedSnapshot.snapshot.pluginId,
+          }
+        : {}),
+    };
     res.status(202).json(body);
-    design.runs.start(run, () => startChatRun(req.body || {}, run));
+    // Plan §3.I1 / spec §10.1 — fire the pipeline schedule on the run's
+    // SSE stream BEFORE the agent process is started. The first
+    // pipeline_stage_started event is emitted synchronously (before
+    // the first await inside runPipelineForRun), so any SSE consumer
+    // that subscribes between create() and start() sees a stage event
+    // ahead of the agent's message_chunk stream — exactly what §8 e2e-3
+    // expects. The stub stage runner returns immediately so a
+    // non-loop pipeline walks through every stage in O(stages) time;
+    // the audit row in `run_devloop_iterations` records the timeline.
+    if (resolvedSnapshot?.ok && resolvedSnapshot.snapshot.pipeline) {
+      firePipelineForRun({
+        run,
+        snapshot: resolvedSnapshot.snapshot,
+        runs: design.runs,
+        db,
+      });
+    }
+    reconcileAssistantMessageOnRunEnd(db, design.runs, run);
+    design.runs.start(run, () => startChatRun(meta, run));
   });
 
   app.get('/api/runs', (req, res) => {
@@ -6696,6 +10367,55 @@ export async function startServer({
     design.runs.stream(run, req, res);
   });
 
+  // Phase 4 / spec §10.3.5 — AG-UI canonical stream.
+  //
+  // Same data plane as /api/runs/:id/events but every record passes
+  // through `encodeOdEventForAgui` first so an external CopilotKit /
+  // AG-UI client can consume the run unmodified. Events the encoder
+  // can't map are dropped; the SSE stream stays canonical even when
+  // OD adds internal-only events later.
+  app.get('/api/runs/:id/agui', async (req, res) => {
+    const run = design.runs.get(req.params.id);
+    if (!run) return sendApiError(res, 404, 'NOT_FOUND', 'run not found');
+    const { encodeOdEventForAgui } = await import('@open-design/agui-adapter');
+    const sse = createSseResponse(res);
+    const lastEventId = Number(req.get('Last-Event-ID') || req.query.after || 0);
+    const emitMapped = (record) => {
+      const mapped = encodeOdEventForAgui(
+        { kind: record.event, ...(record.data ?? {}) },
+        { runId: run.id, seq: record.id, now: Date.now() },
+      );
+      if (mapped) sse.send(mapped.kind, mapped, record.id);
+    };
+    for (const record of run.events) {
+      if (!Number.isFinite(lastEventId) || record.id > lastEventId) emitMapped(record);
+    }
+    if (design.runs.isTerminal(run.status)) {
+      sse.end();
+      return;
+    }
+    // Mirror runs.stream's subscriber pattern but route through the
+    // adapter. We attach a thin wrapper to run.clients so the existing
+    // emit() loop reaches us; the wrapper only implements the
+    // {send,end,cleanup} surface the runs service uses.
+    const adapterClient = {
+      send: (event, data, id) => {
+        const mapped = encodeOdEventForAgui(
+          { kind: event, ...(data ?? {}) },
+          { runId: run.id, seq: id, now: Date.now() },
+        );
+        if (mapped) sse.send(mapped.kind, mapped, id);
+      },
+      end:     () => sse.end(),
+      cleanup: () => sse.cleanup?.(),
+    };
+    run.clients.add(adapterClient);
+    res.on('close', () => {
+      run.clients.delete(adapterClient);
+      sse.cleanup?.();
+    });
+  });
+
   app.post('/api/runs/:id/cancel', (req, res) => {
     const run = design.runs.get(req.params.id);
     if (!run) return sendApiError(res, 404, 'NOT_FOUND', 'run not found');
@@ -6714,880 +10434,307 @@ export async function startServer({
     design.runs.start(run, () => startChatRun(req.body || {}, run));
   });
 
-  // ---- Connection tests (single-shot JSON; no SSE) ------------------------
-  // Settings dialog uses these to verify a config works without sending a
-  // real chat. Always return HTTP 200 with `ok: false` on upstream-caused
-  // failures so the web layer can render a categorized inline status without
-  // unwrapping nested error envelopes; real 4xx/5xx here mean a malformed
-  // request or daemon bug.
-  app.post('/api/provider/models', async (req, res) => {
-    const controller = new AbortController();
-    const abortIfRequestAborted = () => {
-      if ((req.aborted || !req.complete) && !res.writableEnded) {
-        controller.abort();
-      }
-    };
-    const abortIfResponseClosed = () => {
-      if (!res.writableEnded) controller.abort();
-    };
-    req.on('close', abortIfRequestAborted);
-    res.on('close', abortIfResponseClosed);
-    const body = req.body || {};
-    const protocol = body.protocol;
-    if (
-      typeof protocol !== 'string' ||
-      !['anthropic', 'openai', 'azure', 'google', 'ollama'].includes(protocol)
-    ) {
-      return sendApiError(
-        res,
-        400,
-        'BAD_REQUEST',
-        'protocol must be one of anthropic|openai|azure|google|ollama',
-      );
+  // Each routine fire resolves an agent, prepares project/conversation state,
+  // and dispatches into the same chat runner used by manual runs.
+  routineService.setRunHandler(async ({ routine, trigger, startedAt, runId }) => {
+    const appConfig = await readAppConfig(RUNTIME_DATA_DIR);
+    let agentId = routine.agentId
+      || (typeof appConfig.agentId === 'string' && appConfig.agentId ? appConfig.agentId : null);
+    if (!agentId) {
+      const agents = await detectAgents(appConfig.agentCliEnv ?? {}).catch(() => []);
+      agentId = agents.find((agent) => agent.available)?.id ?? null;
     }
-    if (
-      typeof body.baseUrl !== 'string' ||
-      typeof body.apiKey !== 'string' ||
-      !body.baseUrl.trim() ||
-      !body.apiKey.trim()
-    ) {
-      return sendApiError(
-        res,
-        400,
-        'BAD_REQUEST',
-        'baseUrl and apiKey are required',
-      );
+    if (!agentId) {
+      throw new Error('No available agent is configured. Choose an agent in Settings first.');
     }
-    try {
-      const result = await listProviderModels({
-        protocol,
-        baseUrl: body.baseUrl,
-        apiKey: body.apiKey,
-        apiVersion:
-          typeof body.apiVersion === 'string' ? body.apiVersion : undefined,
-        signal: controller.signal,
-      });
-      return res.json(result);
-    } catch (err) {
-      console.warn(
-        `[provider:models] uncaught: ${err instanceof Error ? err.message : String(err)}`,
-      );
-      return sendApiError(res, 500, 'INTERNAL', 'Provider model discovery failed');
-    }
-  });
 
-  app.post('/api/test/connection', async (req, res) => {
-    const controller = new AbortController();
-    const abortIfRequestAborted = () => {
-      if ((req.aborted || !req.complete) && !res.writableEnded) {
-        controller.abort();
-      }
-    };
-    const abortIfResponseClosed = () => {
-      if (!res.writableEnded) controller.abort();
-    };
-    req.on('close', abortIfRequestAborted);
-    res.on('close', abortIfResponseClosed);
-    const body = req.body || {};
-    try {
-      if (body.mode === 'provider') {
-        const protocol = body.protocol;
-        if (
-          typeof protocol !== 'string' ||
-          !['anthropic', 'openai', 'azure', 'google', 'ollama'].includes(protocol)
-        ) {
-          return sendApiError(
-            res,
-            400,
-            'BAD_REQUEST',
-            'protocol must be one of anthropic|openai|azure|google|ollama',
-          );
-        }
-        if (
-          typeof body.baseUrl !== 'string' ||
-          typeof body.apiKey !== 'string' ||
-          typeof body.model !== 'string' ||
-          !body.baseUrl.trim() ||
-          !body.apiKey.trim() ||
-          !body.model.trim()
-        ) {
-          return sendApiError(
-            res,
-            400,
-            'BAD_REQUEST',
-            'baseUrl, apiKey, and model are required',
-          );
-        }
-        try {
-          const result = await testProviderConnection({
-            protocol,
-            baseUrl: body.baseUrl,
-            apiKey: body.apiKey,
-            model: body.model,
-            apiVersion:
-              typeof body.apiVersion === 'string' ? body.apiVersion : undefined,
-            signal: controller.signal,
-          });
-          return res.json(result);
-        } catch (err) {
-          console.warn(
-            `[test:provider] uncaught: ${err instanceof Error ? err.message : String(err)}`,
-          );
-          return sendApiError(res, 500, 'INTERNAL', 'Connection test failed');
-        }
-      }
-
-      if (body.mode === 'agent') {
-        if (typeof body.agentId !== 'string' || !body.agentId.trim()) {
-          return sendApiError(res, 400, 'BAD_REQUEST', 'agentId is required');
-        }
-        try {
-          const def = getAgentDef(body.agentId);
-          const testStart = Date.now();
-          const safeModel =
-            def && typeof body.model === 'string'
-              ? isKnownModel(def, body.model)
-                ? body.model
-                : sanitizeCustomModel(body.model)
-              : undefined;
-          if (def && typeof body.model === 'string' && body.model.trim() && !safeModel) {
-            return res.json({
-              ok: false,
-              kind: 'invalid_model_id',
-              latencyMs: Date.now() - testStart,
-              model: body.model.trim(),
-              agentName: def.name,
-              detail: 'Invalid custom model id. Use a model id that starts with a letter or number and contains no spaces.',
-            });
+    const now = startedAt;
+    const routineContext = normalizeRunContextSelection(routine.context);
+    const routineSkillId = routine.skillId ?? routineContext.skillIds?.[0] ?? null;
+    const contextMetadata = {
+      ...(routineContext.pluginIds?.length
+        ? {
+            contextPlugins: routineContext.pluginIds.map((id) => {
+              const plugin = getInstalledPlugin(db, id);
+              return {
+                id,
+                title: plugin?.title ?? id,
+                ...(plugin?.manifest?.description ? { description: plugin.manifest.description } : {}),
+              };
+            }),
           }
-          const safeReasoning =
-            def &&
-            typeof body.reasoning === 'string' &&
-            Array.isArray(def.reasoningOptions)
-              ? (def.reasoningOptions.find((r) => r.id === body.reasoning)?.id ?? undefined)
-              : undefined;
-          const result = await testAgentConnection({
-            agentId: body.agentId,
-            model: safeModel ?? undefined,
-            reasoning: safeReasoning,
-            agentCliEnv:
-              body.agentCliEnv && typeof body.agentCliEnv === 'object'
-                ? body.agentCliEnv
-                : undefined,
-            signal: controller.signal,
-          });
-          return res.json(result);
-        } catch (err) {
-          console.warn(
-            `[test:agent] uncaught: ${err instanceof Error ? err.message : String(err)}`,
-          );
-          return sendApiError(res, 500, 'INTERNAL', 'Agent test failed');
-        }
-      }
-
-      return sendApiError(
-        res,
-        400,
-        'BAD_REQUEST',
-        'mode must be one of provider|agent',
-      );
-    } finally {
-      req.off('close', abortIfRequestAborted);
-      res.off('close', abortIfResponseClosed);
+        : {}),
+      ...(routineContext.mcpServerIds?.length
+        ? { contextMcpServers: routineContext.mcpServerIds.map((id) => ({ id })) }
+        : {}),
+      ...(routineContext.connectorIds?.length
+        ? { contextConnectors: routineContext.connectorIds.map((id) => ({ id, name: id })) }
+        : {}),
+    };
+    const stamp = formatLocalProjectTimestamp(new Date(now).toISOString());
+    let projectId;
+    let projectName;
+    if (routine.target.mode === 'reuse') {
+      const project = getProject(db, routine.target.projectId);
+      if (!project) throw new Error(`Routine target project ${routine.target.projectId} not found`);
+      projectId = project.id;
+      projectName = project.name;
+    } else {
+      projectId = `routine-${randomUUID()}`;
+      projectName = `${routine.name} · ${stamp}`;
+      insertProject(db, {
+        id: projectId,
+        name: projectName,
+        skillId: routineSkillId,
+        designSystemId: appConfig.designSystemId ?? null,
+        pendingPrompt: null,
+        metadata: {
+          kind: 'other',
+          intent: 'automation',
+          automationId: routine.id,
+          routineId: routine.id,
+          trigger,
+          ...contextMetadata,
+        },
+        createdAt: now,
+        updatedAt: now,
+      });
     }
-  });
 
-  // ---- Critique Theater endpoints (Phase 6) --------------------------------
-
-  // POST /api/projects/:projectId/critique/:runId/interrupt
-  // Cascades an AbortController to the in-flight orchestrator for the given run.
-  app.post(
-    '/api/projects/:projectId/critique/:runId/interrupt',
-    handleCritiqueInterrupt(db, critiqueRunRegistry),
-  );
-
-  // ---- API Proxy (SSE) for API-compatible endpoints ------------------------
-  // Browser → daemon → external API. Avoids CORS issues with third-party
-  // providers. This keeps BYOK setup zero-config for local users at the cost of
-  // one local streaming hop through the daemon.
-
-  const redactAuthTokens = (text) =>
-    text.replace(/Bearer [A-Za-z0-9_\-.+/=]+/g, 'Bearer [REDACTED]');
-
-  const validateExternalApiBaseUrl = (baseUrl) => {
-    return validateBaseUrl(baseUrl);
-  };
-
-  const proxyErrorCode = (status) => {
-    if (status === 401) return 'UNAUTHORIZED';
-    if (status === 403) return 'FORBIDDEN';
-    if (status === 404) return 'NOT_FOUND';
-    if (status === 429) return 'RATE_LIMITED';
-    return 'UPSTREAM_UNAVAILABLE';
-  };
-
-  const sendProxyError = (sse, message, init = {}) => {
-    sse.send('error', {
-      message,
-      error: {
-        code: init.code || 'UPSTREAM_UNAVAILABLE',
-        message,
-        ...(init.details === undefined ? {} : { details: init.details }),
-        ...(init.retryable === undefined ? {} : { retryable: init.retryable }),
-      },
+    const conversationId = `routine-conv-${randomUUID()}`;
+    const conversationTitle = routine.target.mode === 'reuse'
+      ? `${routine.name} · ${stamp}`
+      : projectName;
+    insertConversation(db, {
+      id: conversationId,
+      projectId,
+      title: conversationTitle,
+      createdAt: now,
+      updatedAt: now,
     });
-  };
 
-  const appendVersionedApiPath = (baseUrl, path) => {
-    const url = new URL(baseUrl);
-    // `URL.pathname` setter normalizes an empty string back to "/", so
-    // we work in a local string to detect the no-path and no-version
-    // cases.
-    const trimmed = url.pathname.replace(/\/+$/, '');
-    // Auto-inject `/v1` whenever the supplied path doesn't already
-    // contain a `/vN` segment. This handles all four preset shapes:
-    //   bare host                            → /v1/<route>            (api.openai.com, api.anthropic.com)
-    //   ends in /vN                          → no inject              (api.openai.com/v1, /v1)
-    //   /vN sub-path                         → no inject              (api.deepinfra.com/v1/openai, openrouter.ai/api/v1)
-    //   non-versioned compat sub-path        → /v1/<route>            (api.deepseek.com/anthropic, api.minimaxi.com/anthropic)
-    // Previously the check was end-of-path only, which broke the
-    // /v1/openai sub-path case. A naive "non-empty path → respect"
-    // would break the /anthropic sub-path case. Matching `/vN` as a
-    // segment anywhere in the path threads both correctly.
-    url.pathname = /\/v\d+(\/|$)/.test(trimmed)
-      ? `${trimmed}${path}`
-      : `${trimmed}/v1${path}`;
-    return url.toString();
-  };
+    // Notify any open `ProjectView` watching this project so its
+    // conversation list picks up the new routine conversation without
+    // requiring the user to leave and re-enter the project (#1361).
+    // For reuse-an-existing-project mode this is the only path the
+    // open view has to learn the conversation exists; for new-project
+    // mode this is harmless (no subscribers for a project that was
+    // just created milliseconds ago). The payload shape is the shared
+    // `ProjectConversationCreatedSsePayload` from `@open-design/contracts`
+    // so the daemon producer and the web consumer cannot drift.
+    /** @type {ProjectConversationCreatedSsePayload} */
+    const conversationCreatedEvent = {
+      type: 'conversation-created',
+      projectId,
+      conversationId,
+      title: conversationTitle,
+      createdAt: now,
+    };
+    emitProjectEvent(projectId, conversationCreatedEvent);
 
-  const collectSseFrame = (frame) => {
-    const lines = frame.replace(/\r/g, '').split('\n');
-    const dataLines = [];
-    let event = 'message';
-    for (const line of lines) {
-      if (line.startsWith('event:')) {
-        event = line.slice(6).trim();
-        continue;
+    const assistantMessageId = `routine-assistant-${randomUUID()}`;
+    let resolvedRoutineSnapshot = null;
+    const primaryPluginId = routineContext.pluginIds?.[0] ?? null;
+    if (primaryPluginId) {
+      const registry = await loadPluginRegistryView();
+      const resolved = resolvePluginSnapshot({
+        db,
+        body: {
+          pluginId: primaryPluginId,
+          pluginInputs: { prompt: routine.prompt },
+        },
+        projectId,
+        conversationId,
+        registry,
+        activeProjectDesignSystem:
+          typeof appConfig.designSystemId === 'string' && appConfig.designSystemId.length > 0
+            ? { id: appConfig.designSystemId }
+            : undefined,
+      });
+      if (resolved && !resolved.ok) {
+        throw new Error(`Automation plugin ${primaryPluginId} could not be applied: ${JSON.stringify(resolved.body)}`);
       }
-      if (!line.startsWith('data:')) continue;
-      let value = line.slice(5);
-      if (value.startsWith(' ')) value = value.slice(1);
-      dataLines.push(value);
-    }
-    const payload = dataLines.join('\n');
-    if (!payload) return { event, payload: '', data: null };
-    if (payload === '[DONE]') return { event, payload, data: null };
-    try {
-      return { event, payload, data: JSON.parse(payload) };
-    } catch {
-      return { event, payload, data: null };
-    }
-  };
-
-  const streamUpstreamSse = async (response, onFrame) => {
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-
-      while (true) {
-        const match = buffer.match(/\r?\n\r?\n/);
-        if (!match || match.index === undefined) break;
-        const frame = buffer.slice(0, match.index);
-        buffer = buffer.slice(match.index + match[0].length);
-        if (await onFrame(collectSseFrame(frame))) return;
-      }
+      resolvedRoutineSnapshot = resolved;
     }
 
-    const tail = buffer.trim();
-    if (tail) await onFrame(collectSseFrame(tail));
-  };
-
-  // Ollama Cloud streams NDJSON (newline-delimited JSON) — each line is a
-  // complete JSON object. Parse per-line and dispatch parsed objects.
-  const streamUpstreamNdjson = async (response, onFrame) => {
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-
-      let newline = buffer.indexOf('\n');
-      while (newline !== -1) {
-        const line = buffer.slice(0, newline).trim();
-        buffer = buffer.slice(newline + 1);
-        newline = buffer.indexOf('\n');
-        if (!line) continue;
-        try {
-          const data = JSON.parse(line);
-          if (await onFrame({ data })) return;
-        } catch {
-          // skip unparseable lines
-        }
-      }
-    }
-
-    const tail = buffer.trim();
-    if (tail) {
+    const run = design.runs.create({
+      projectId,
+      conversationId,
+      assistantMessageId,
+      clientRequestId: `routine-${trigger}-${randomUUID()}`,
+      agentId,
+      ...(resolvedRoutineSnapshot?.ok
+        ? {
+            appliedPluginSnapshotId: resolvedRoutineSnapshot.snapshotId,
+            pluginId: resolvedRoutineSnapshot.snapshot.pluginId,
+          }
+        : {}),
+    });
+    if (resolvedRoutineSnapshot?.ok) {
       try {
-        const data = JSON.parse(tail);
-        await onFrame({ data });
+        const { linkSnapshotToRun } = await import('./plugins/snapshots.js');
+        linkSnapshotToRun(db, resolvedRoutineSnapshot.snapshotId, run.id);
       } catch {
-        // skip
+        // Snapshot linking is best-effort; the in-memory run still carries it.
       }
     }
-  };
+    upsertMessage(db, conversationId, {
+      id: `routine-user-${run.id}`,
+      role: 'user',
+      content: routine.prompt,
+    });
+    upsertMessage(db, conversationId, {
+      id: assistantMessageId,
+      role: 'assistant',
+      content: '',
+      agentId,
+      agentName: getAgentDef(agentId)?.name ?? agentId,
+      runId: run.id,
+      runStatus: 'queued',
+      startedAt: now,
+    });
 
-  const extractOpenAIText = (data) => {
-    const choices = data?.choices;
-    if (!Array.isArray(choices) || choices.length === 0) return '';
-    const first = choices[0];
-    if (typeof first?.delta?.content === 'string') return first.delta.content;
-    if (typeof first?.text === 'string') return first.text;
-    return '';
-  };
+    const modelPrefs = appConfig.agentModels?.[agentId] ?? {};
+    design.runs.start(run, () => startChatRun({
+      agentId,
+      projectId,
+      conversationId: run.conversationId,
+      assistantMessageId: run.assistantMessageId,
+      clientRequestId: run.clientRequestId,
+      skillId: routineSkillId,
+      designSystemId: appConfig.designSystemId ?? null,
+      context: routineContext,
+      model: modelPrefs.model ?? null,
+      reasoning: modelPrefs.reasoning ?? null,
+      message: routine.prompt,
+      systemPrompt: [
+        `You are running an unattended scheduled routine named "${routine.name}".`,
+        'Do not ask follow-up questions, do not emit <question-form>, and do not wait for user input. Pick reasonable defaults and finish the task.',
+      ].join('\n'),
+    }, run));
 
-  const extractStreamErrorMessage = (data) => {
-    const err = data?.error;
-    if (!err) return '';
-    if (typeof err === 'string') return err;
-    if (typeof err?.message === 'string') return err.message;
-    try {
-      return JSON.stringify(err);
-    } catch {
-      return 'unspecified provider error';
-    }
-  };
-
-  const extractGeminiText = (data) => {
-    const candidates = data?.candidates;
-    if (!Array.isArray(candidates) || candidates.length === 0) return '';
-    const parts = candidates[0]?.content?.parts;
-    if (!Array.isArray(parts)) return '';
-    return parts.map((part) => part?.text).filter((text) => typeof text === 'string').join('');
-  };
-
-  const benignGeminiFinishReasons = new Set(['', 'STOP', 'MAX_TOKENS', 'FINISH_REASON_UNSPECIFIED']);
-  const extractGeminiBlockMessage = (data) => {
-    const feedback = data?.promptFeedback;
-    if (typeof feedback?.blockReason === 'string' && feedback.blockReason) {
-      const tail = typeof feedback.blockReasonMessage === 'string' && feedback.blockReasonMessage
-        ? ` — ${feedback.blockReasonMessage}`
-        : '';
-      return `Gemini blocked the prompt (${feedback.blockReason})${tail}.`;
-    }
-    const candidates = data?.candidates;
-    if (!Array.isArray(candidates)) return '';
-    for (const candidate of candidates) {
-      const reason = candidate?.finishReason;
-      if (typeof reason !== 'string' || benignGeminiFinishReasons.has(reason)) continue;
-      const tail = typeof candidate?.finishMessage === 'string' && candidate.finishMessage
-        ? ` — ${candidate.finishMessage}`
-        : '';
-      return `Gemini stopped the response (${reason})${tail}.`;
-    }
-    return '';
-  };
-
-  app.post('/api/proxy/anthropic/stream', async (req, res) => {
-    /** @type {Partial<ProxyStreamRequest>} */
-    const proxyBody = req.body || {};
-    const { baseUrl, apiKey, model, systemPrompt, messages, maxTokens } =
-      proxyBody;
-    if (!baseUrl || !apiKey || !model) {
-      return sendApiError(
-        res,
-        400,
-        'BAD_REQUEST',
-        'baseUrl, apiKey, and model are required',
-      );
-    }
-
-    const validated = validateExternalApiBaseUrl(baseUrl);
-    if (validated.error) {
-      return sendApiError(
-        res,
-        validated.forbidden ? 403 : 400,
-        validated.forbidden ? 'FORBIDDEN' : 'BAD_REQUEST',
-        validated.error,
-      );
-    }
-
-    const url = appendVersionedApiPath(baseUrl, '/messages');
-    console.log(
-      `[proxy:anthropic] ${req.method} ${validated.parsed.hostname} model=${model}`,
-    );
-
-    const payload = {
-      model,
-      max_tokens:
-        typeof maxTokens === 'number' && maxTokens > 0 ? maxTokens : 8192,
-      messages: Array.isArray(messages) ? messages : [],
-      stream: true,
-    };
-    if (typeof systemPrompt === 'string' && systemPrompt) {
-      payload.system = systemPrompt;
-    }
-
-    const sse = createSseResponse(res);
-    sse.send('start', { model });
-    try {
-      const response = await fetch(url, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-api-key': apiKey,
-          'anthropic-version': '2023-06-01',
-        },
-        body: JSON.stringify(payload),
-        redirect: 'error',
-      });
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        console.error(
-          `[proxy:anthropic] upstream error: ${response.status} ${redactAuthTokens(errorText)}`,
-        );
-        sendProxyError(sse, `Upstream error: ${response.status}`, {
-          code: proxyErrorCode(response.status),
-          details: errorText,
-          retryable: response.status === 429 || response.status >= 500,
+    const completion = (async () => {
+      const finalStatus = await design.runs.wait(run);
+      const failureError = finalStatus.status === 'failed'
+        ? (typeof finalStatus.error === 'string' && finalStatus.error.trim() ? finalStatus.error.trim() : null)
+        : null;
+      const failureErrorCode = finalStatus.status === 'failed'
+        ? (typeof finalStatus.errorCode === 'string' && finalStatus.errorCode.trim() ? finalStatus.errorCode.trim() : null)
+        : null;
+      if (failureError) {
+        appendMessageStatusEvent(db, assistantMessageId, {
+          label: 'error',
+          detail: failureError,
         });
-        return sse.end();
       }
+      db.prepare(`UPDATE messages SET run_status = ?, ended_at = ? WHERE id = ?`)
+        .run(finalStatus.status, Date.now(), assistantMessageId);
+      let evolutionSummary = '';
+      if (finalStatus.status === 'succeeded' && routineContext.connectorIds?.length) {
+        try {
+          const evolution = await ingestRoutineConnectorEvolution(RUNTIME_DATA_DIR, {
+            routine,
+            runId,
+            trigger,
+            status: finalStatus.status,
+            projectId,
+            conversationId,
+            agentRunId: run.id,
+            summary: `Routine "${routine.name}" ${finalStatus.status}.`,
+            connectorIds: routineContext.connectorIds,
+            messages: listMessages(db, conversationId),
+          });
+          if (evolution?.proposals?.length) {
+            evolutionSummary = ` Created ${evolution.proposals.length} self-evolution proposal(s) from connector context.`;
+          }
+        } catch (error) {
+          evolutionSummary = ` Connector self-evolution ingestion failed: ${error instanceof Error ? error.message : String(error)}.`;
+        }
+      }
+      return {
+        status: finalStatus.status,
+        summary: failureError
+          ? `Routine "${routine.name}" failed: ${failureError}`
+          : `Routine "${routine.name}" ${finalStatus.status}.${evolutionSummary}`,
+        error: failureError ?? undefined,
+        errorCode: failureErrorCode ?? undefined,
+      };
+    })();
 
-      let ended = false;
-      await streamUpstreamSse(response, ({ event, data }) => {
-        if (!data) return false;
-        if (event === 'error' || data.type === 'error') {
-          const message = data.error?.message || data.message || 'Anthropic upstream error';
-          sendProxyError(sse, message, { details: data });
-          ended = true;
-          return true;
-        }
-        if (event === 'content_block_delta' && typeof data.delta?.text === 'string') {
-          sse.send('delta', { delta: data.delta.text });
-        }
-        if (event === 'message_stop') {
-          sse.send('end', {});
-          ended = true;
-          return true;
-        }
-        return false;
-      });
-      if (!ended) sse.send('end', {});
-      sse.end();
-    } catch (err) {
-      console.error(`[proxy:anthropic] internal error: ${err.message}`);
-      sendProxyError(sse, err.message, { code: 'INTERNAL_ERROR' });
-      sse.end();
-    }
+    return { projectId, conversationId, agentRunId: run.id, completion };
+  });
+  routineService.start();
+
+  assertServerContextSatisfiesRoutes({
+    db,
+    design,
+    http: httpDeps,
+    paths: pathDeps,
+    ids: idDeps,
+    uploads: uploadDeps,
+    node: nodeDeps,
+    projectStore: projectStoreDeps,
+    projectFiles: projectFileDeps,
+    conversations: conversationDeps,
+    templates: templateDeps,
+    status: projectStatusDeps,
+    events: projectEventDeps,
+    imports: importDeps,
+    exports: projectExportDeps,
+    artifacts: artifactDeps,
+    documents: { buildDocumentPreview },
+    auth: authDeps,
+    liveArtifacts: liveArtifactDeps,
+    deploy: deployDeps,
+    media: mediaDeps,
+    appConfig: appConfigDeps,
+    orbit: orbitDeps,
+    nativeDialogs: nativeDialogDeps,
+    research: researchDeps,
+    mcp: { pendingAuth: mcpPendingAuth, daemonUrlRef },
+    resources: {
+      listAllSkills,
+      listAllDesignTemplates,
+      listAllSkillLikeEntries,
+      listAllDesignSystems,
+      mimeFor,
+    },
+    routines: { routineService },
+    validation: validationDeps,
+    finalize: finalizeDeps,
+    chat: { startChatRun, submitToolResultToRun },
+    agents: agentDeps,
+    critique: critiqueDeps,
+    lifecycle: { isDaemonShuttingDown: () => daemonShuttingDown },
   });
 
-  app.post('/api/proxy/openai/stream', async (req, res) => {
-    /** @type {Partial<ProxyStreamRequest>} */
-    const proxyBody = req.body || {};
-    const { baseUrl, apiKey, model, systemPrompt, messages, maxTokens } =
-      proxyBody;
-    if (!baseUrl || !apiKey || !model) {
-      return sendApiError(
-        res,
-        400,
-        'BAD_REQUEST',
-        'baseUrl, apiKey, and model are required',
-      );
-    }
-
-    const validated = validateExternalApiBaseUrl(baseUrl);
-    if (validated.error) {
-      return sendApiError(
-        res,
-        validated.forbidden ? 403 : 400,
-        validated.forbidden ? 'FORBIDDEN' : 'BAD_REQUEST',
-        validated.error,
-      );
-    }
-
-    const url = appendVersionedApiPath(baseUrl, '/chat/completions');
-    console.log(
-      `[proxy:openai] ${req.method} ${validated.parsed.hostname} model=${model}`,
-    );
-
-    const payloadMessages = Array.isArray(messages) ? [...messages] : [];
-    if (typeof systemPrompt === 'string' && systemPrompt) {
-      payloadMessages.unshift({ role: 'system', content: systemPrompt });
-    }
-
-    const payload = {
-      model,
-      messages: payloadMessages,
-      max_tokens:
-        typeof maxTokens === 'number' && maxTokens > 0 ? maxTokens : 8192,
-      stream: true,
-    };
-
-    const sse = createSseResponse(res);
-    sse.send('start', { model });
-    try {
-      const response = await fetch(url, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${apiKey}`,
-        },
-        body: JSON.stringify(payload),
-        redirect: 'error',
-      });
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        console.error(
-          `[proxy:openai] upstream error: ${response.status} ${redactAuthTokens(errorText)}`,
-        );
-        sendProxyError(sse, `Upstream error: ${response.status}`, {
-          code: proxyErrorCode(response.status),
-          details: errorText,
-          retryable: response.status === 429 || response.status >= 500,
-        });
-        return sse.end();
-      }
-
-      let ended = false;
-      await streamUpstreamSse(response, ({ payload, data }) => {
-        if (payload === '[DONE]') {
-          sse.send('end', {});
-          ended = true;
-          return true;
-        }
-        if (!data) return false;
-        const streamError = extractStreamErrorMessage(data);
-        if (streamError) {
-          sendProxyError(sse, `Provider error: ${streamError}`, { details: data });
-          ended = true;
-          return true;
-        }
-        const delta = extractOpenAIText(data);
-        if (delta) sse.send('delta', { delta });
-        return false;
-      });
-      if (!ended) sse.send('end', {});
-      sse.end();
-    } catch (err) {
-      console.error(`[proxy:openai] internal error: ${err.message}`);
-      sendProxyError(sse, err.message, { code: 'INTERNAL_ERROR' });
-      sse.end();
-    }
+  registerRoutineRoutes(app, {
+    db,
+    paths: { RUNTIME_DATA_DIR },
+    routines: { routineService },
   });
 
-  app.post('/api/proxy/azure/stream', async (req, res) => {
-    /** @type {Partial<ProxyStreamRequest>} */
-    const proxyBody = req.body || {};
-    const { baseUrl, apiKey, model, systemPrompt, messages, maxTokens, apiVersion } =
-      proxyBody;
-    if (!baseUrl || !apiKey || !model) {
-      return sendApiError(
-        res,
-        400,
-        'BAD_REQUEST',
-        'baseUrl, apiKey, and model are required',
-      );
-    }
+  // proxy routes (anthropic / openai / azure / google / ollama) live
+  // in chat-routes.ts now — garnet had a partial duplicate here that
+  // referenced helpers (rejectPluginInProxyBody, extractGeminiText, …)
+  // dropped during the reconcile merge. Deleted to fix the BYOK crash.
+  // Restore the plugin-runs-must-go-through-daemon gate by adding it
+  // to chat-routes.ts if needed.
 
-    const validated = validateExternalApiBaseUrl(baseUrl);
-    if (validated.error) {
-      return sendApiError(
-        res,
-        validated.forbidden ? 403 : 400,
-        validated.forbidden ? 'FORBIDDEN' : 'BAD_REQUEST',
-        validated.error,
-      );
-    }
 
-    const url = new URL(baseUrl);
-    const basePath = url.pathname.replace(/\/+$/, '');
-    const usesVersionedOpenAIPath = /\/openai\/v\d+(?:$|\/)/.test(basePath);
-    const version =
-      typeof apiVersion === 'string' && apiVersion.trim()
-        ? apiVersion.trim()
-        : usesVersionedOpenAIPath
-          ? ''
-          : '2024-10-21';
-    url.pathname = usesVersionedOpenAIPath
-      ? `${basePath}/chat/completions`
-      : `${basePath}/openai/deployments/${encodeURIComponent(model)}/chat/completions`;
-    if (usesVersionedOpenAIPath && !version) {
-      url.searchParams.delete('api-version');
-    }
-    if (version) {
-      url.searchParams.set('api-version', version);
-    }
-    console.log(
-      `[proxy:azure] ${req.method} ${validated.parsed.hostname} deployment=${model} api-version=${version || 'omitted'}`,
-    );
+  registerChatRoutes(app, {
+    db,
+    design,
+    http: httpDeps,
+    chat: { startChatRun, submitToolResultToRun },
+    agents: agentDeps,
+    critique: critiqueDeps,
+    validation: validationDeps,
+    lifecycle: { isDaemonShuttingDown: () => daemonShuttingDown },
 
-    const payloadMessages = Array.isArray(messages) ? [...messages] : [];
-    if (typeof systemPrompt === 'string' && systemPrompt) {
-      payloadMessages.unshift({ role: 'system', content: systemPrompt });
-    }
-
-    const payload = {
-      ...(usesVersionedOpenAIPath ? { model } : {}),
-      messages: payloadMessages,
-      max_tokens:
-        typeof maxTokens === 'number' && maxTokens > 0 ? maxTokens : 8192,
-      stream: true,
-    };
-
-    const sse = createSseResponse(res);
-    sse.send('start', { model });
-    try {
-      const response = await fetch(url, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'api-key': apiKey,
-        },
-        body: JSON.stringify(payload),
-        redirect: 'error',
-      });
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        console.error(
-          `[proxy:azure] upstream error: ${response.status} ${redactAuthTokens(errorText)}`,
-        );
-        sendProxyError(sse, `Upstream error: ${response.status}`, {
-          code: proxyErrorCode(response.status),
-          details: errorText,
-          retryable: response.status === 429 || response.status >= 500,
-        });
-        return sse.end();
-      }
-
-      let ended = false;
-      await streamUpstreamSse(response, ({ payload: ssePayload, data }) => {
-        if (ssePayload === '[DONE]') {
-          sse.send('end', {});
-          ended = true;
-          return true;
-        }
-        if (!data) return false;
-        const streamError = extractStreamErrorMessage(data);
-        if (streamError) {
-          sendProxyError(sse, `Azure error: ${streamError}`, { details: data });
-          ended = true;
-          return true;
-        }
-        const delta = extractOpenAIText(data);
-        if (delta) sse.send('delta', { delta });
-        return false;
-      });
-      if (!ended) sse.send('end', {});
-      sse.end();
-    } catch (err) {
-      console.error(`[proxy:azure] internal error: ${err.message}`);
-      sendProxyError(sse, err.message, { code: 'INTERNAL_ERROR' });
-      sse.end();
-    }
   });
 
-  app.post('/api/proxy/google/stream', async (req, res) => {
-    /** @type {Partial<ProxyStreamRequest>} */
-    const proxyBody = req.body || {};
-    const { baseUrl, apiKey, model, systemPrompt, messages, maxTokens } = proxyBody;
-    if (!apiKey || !model) {
-      return sendApiError(
-        res,
-        400,
-        'BAD_REQUEST',
-        'apiKey and model are required',
-      );
-    }
-
-    const effectiveBaseUrl = baseUrl || 'https://generativelanguage.googleapis.com';
-    const validated = validateExternalApiBaseUrl(effectiveBaseUrl);
-    if (validated.error) {
-      return sendApiError(
-        res,
-        validated.forbidden ? 403 : 400,
-        validated.forbidden ? 'FORBIDDEN' : 'BAD_REQUEST',
-        validated.error,
-      );
-    }
-
-    const clean = effectiveBaseUrl.replace(/\/+$/, '');
-    const url = `${clean}/v1beta/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse`;
-    console.log(
-      `[proxy:google] ${req.method} ${validated.parsed.hostname} model=${model}`,
-    );
-
-    const contents = (Array.isArray(messages) ? messages : []).map((message) => ({
-      role: message.role === 'assistant' ? 'model' : 'user',
-      parts: [{ text: message.content }],
-    }));
-    const payload = {
-      contents,
-      generationConfig: {
-        maxOutputTokens:
-          typeof maxTokens === 'number' && maxTokens > 0 ? maxTokens : 8192,
-      },
-    };
-    if (typeof systemPrompt === 'string' && systemPrompt) {
-      payload.systemInstruction = { parts: [{ text: systemPrompt }] };
-    }
-
-    const sse = createSseResponse(res);
-    sse.send('start', { model });
-    try {
-      const response = await fetch(url, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-goog-api-key': apiKey,
-        },
-        body: JSON.stringify(payload),
-        redirect: 'error',
-      });
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        console.error(
-          `[proxy:google] upstream error: ${response.status} ${redactAuthTokens(errorText)}`,
-        );
-        sendProxyError(sse, `Upstream error: ${response.status}`, {
-          code: proxyErrorCode(response.status),
-          details: errorText,
-          retryable: response.status === 429 || response.status >= 500,
-        });
-        return sse.end();
-      }
-
-      let ended = false;
-      await streamUpstreamSse(response, ({ data }) => {
-        if (!data) return false;
-        const streamError = extractStreamErrorMessage(data);
-        if (streamError) {
-          sendProxyError(sse, `Gemini error: ${streamError}`, { details: data });
-          ended = true;
-          return true;
-        }
-        const delta = extractGeminiText(data);
-        if (delta) sse.send('delta', { delta });
-        const blockMessage = extractGeminiBlockMessage(data);
-        if (blockMessage) {
-          sendProxyError(sse, blockMessage, { details: data });
-          ended = true;
-          return true;
-        }
-        return false;
-      });
-      if (!ended) sse.send('end', {});
-      sse.end();
-    } catch (err) {
-      console.error(`[proxy:google] internal error: ${err.message}`);
-      sendProxyError(sse, err.message, { code: 'INTERNAL_ERROR' });
-      sse.end();
-    }
-  });
-
-  app.post('/api/proxy/ollama/stream', async (req, res) => {
-    /** @type {Partial<ProxyStreamRequest>} */
-    const proxyBody = req.body || {};
-    const { baseUrl, apiKey, model, systemPrompt, messages, maxTokens } = proxyBody;
-    if (!apiKey || !model) {
-      return sendApiError(
-        res,
-        400,
-        'BAD_REQUEST',
-        'apiKey and model are required',
-      );
-    }
-
-    const effectiveBaseUrl = baseUrl || 'https://ollama.com';
-    const validated = validateExternalApiBaseUrl(effectiveBaseUrl);
-    if (validated.error) {
-      return sendApiError(
-        res,
-        validated.forbidden ? 403 : 400,
-        validated.forbidden ? 'FORBIDDEN' : 'BAD_REQUEST',
-        validated.error,
-      );
-    }
-
-    const clean = effectiveBaseUrl.replace(/\/+$/, '').replace(/\/api\/?$/, '');
-    const url = `${clean}/api/chat`;
-    console.log(
-      `[proxy:ollama] ${req.method} ${validated.parsed.hostname} model=${model}`,
-    );
-
-    const payloadMessages = Array.isArray(messages) ? [...messages] : [];
-    if (typeof systemPrompt === 'string' && systemPrompt) {
-      payloadMessages.unshift({ role: 'system', content: systemPrompt });
-    }
-
-    const payload = {
-      model,
-      messages: payloadMessages,
-      stream: true,
-    };
-    if (typeof maxTokens === 'number' && maxTokens > 0) {
-      payload.options = { num_predict: maxTokens };
-    }
-
-    const sse = createSseResponse(res);
-    sse.send('start', { model });
-    try {
-      const response = await fetch(url, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${apiKey}`,
-        },
-        body: JSON.stringify(payload),
-      });
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        console.error(
-          `[proxy:ollama] upstream error: ${response.status} ${redactAuthTokens(errorText)}`,
-        );
-        sendProxyError(sse, `Upstream error: ${response.status}`, {
-          code: proxyErrorCode(response.status),
-          details: errorText,
-          retryable: response.status === 429 || response.status >= 500,
-        });
-        return sse.end();
-      }
-
-      let ended = false;
-      await streamUpstreamNdjson(response, ({ data }) => {
-        if (!data) return false;
-        if (data.done) {
-          sse.send('end', {});
-          ended = true;
-          return true;
-        }
-        const content = data.message?.content;
-        if (typeof content === 'string' && content) {
-          sse.send('delta', { delta: content });
-        }
-        return false;
-      });
-      if (!ended) sse.send('end', {});
-      sse.end();
-    } catch (err) {
-      console.error(`[proxy:ollama] internal error: ${err.message}`);
-      sendProxyError(sse, err.message, { code: 'INTERNAL_ERROR' });
-      sse.end();
-    }
-  });
+  registerStaticSpaFallback(app, STATIC_DIR);
 
   // Wait for `listen` to bind so callers always see the resolved URL —
   // critical when port=0 (ephemeral port) and when the embedding sidecar
@@ -7608,6 +10755,7 @@ export async function startServer({
       daemonShutdownStarted = true;
       daemonShuttingDown = true;
       await design.runs.shutdownActive({ graceMs: resolveChatRunShutdownGraceMs() });
+      await design.analytics.shutdown();
     };
     let server;
     try {

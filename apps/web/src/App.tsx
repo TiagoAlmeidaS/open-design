@@ -1,11 +1,30 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { useAnalytics } from './analytics/provider';
+import { trackAppLaunch, trackProjectCreateResult } from './analytics/events';
+import { detectClientType, detectLaunchSource } from './analytics/identity';
+import {
+  projectKindToTracking,
+  fidelityToTracking,
+} from '@open-design/contracts/analytics';
 import { EntryView } from './components/EntryView';
+import type { IntegrationTab } from './components/IntegrationsView';
+import { MarketplaceView } from './components/MarketplaceView';
+import { PluginDetailView } from './components/PluginDetailView';
 import type { CreateInput } from './components/NewProjectPanel';
-import { PetOverlay } from './components/pet/PetOverlay';
+import { MemoryToast } from './components/MemoryToast';
+import { PetOverlay, type PetTaskCenter } from './components/pet/PetOverlay';
+import { buildPetTaskCenter } from './components/pet/taskCenter';
 import { migrateCustomPetAtlas } from './components/pet/pets';
 import { ProjectView } from './components/ProjectView';
+import { WorkspaceTabsBar } from './components/WorkspaceTabsBar';
+import {
+  DesignSystemCreationFlow,
+  DesignSystemDetailView,
+} from './components/DesignSystemFlow';
 import {
   SettingsDialog,
+  switchApiProtocolConfig,
+  updateCurrentApiProtocolConfig,
   type SettingsSection,
 } from './components/SettingsDialog';
 import { PrivacyConsentModal } from './components/PrivacyConsentModal';
@@ -14,9 +33,12 @@ import {
   fetchAppVersionInfo,
   fetchAgents,
   fetchDesignSystems,
+  fetchDesignTemplates,
   fetchPromptTemplates,
   fetchSkills,
+  uploadProjectFiles,
 } from './providers/registry';
+import { RUNS_CHANGED_EVENT, listProjectRuns } from './providers/daemon';
 import { navigate, useRoute } from './router';
 import {
   fetchDaemonConfig,
@@ -34,21 +56,32 @@ import {
   syncMediaProvidersToDaemon,
 } from './state/config';
 import { applyAppearanceToDocument } from './state/appearance';
+import { isMacPlatform } from './utils/platform';
 import {
   createProject,
+  createPluginShareProject,
   deleteProject as deleteProjectApi,
+  getProject,
   importClaudeDesignZip,
   importFolderProject,
   listProjects,
   listTemplates,
+  deleteTemplate,
   patchProject,
 } from './state/projects';
+import type {
+  PluginShareAction,
+  PluginShareProjectOutcome,
+} from './state/projects';
+import type { OpenDesignHostProjectImportSuccess } from '@open-design/host';
 import { useI18n } from './i18n';
 import { liveArtifactTabId } from './types';
 import type {
   AgentInfo,
+  ApiProtocol,
   AppConfig,
   AppVersionInfo,
+  ChatAttachment,
   DesignSystemSummary,
   Project,
   ProjectTemplate,
@@ -103,6 +136,26 @@ export function buildPersistedConfig(next: AppConfig, current: AppConfig): AppCo
   };
 }
 
+/**
+ * True when `next` and `last` produce an identical persisted shape —
+ * i.e. the only diffs between them are fields that buildPersistedConfig
+ * intentionally strips before disk/daemon writes (the Composio API key
+ * draft today; any future save-on-explicit-confirm secrets later).
+ *
+ * The autosave loop in Settings uses this to skip the "All changes
+ * saved" indicator transition when the user has only typed an unsaved
+ * secret. Without it, autosave completes a no-op write and flashes
+ * "Saved" — misleading users into trusting that a sensitive key has
+ * been persisted when in fact only the section-local "Save key"
+ * gesture commits it.
+ */
+export function isAutosaveDraftOnlyChange(next: AppConfig, last: AppConfig): boolean {
+  return (
+    JSON.stringify(buildPersistedConfig(next, next))
+    === JSON.stringify(buildPersistedConfig(last, last))
+  );
+}
+
 export function resolveSettingsCloseConfig(
   rendered: AppConfig,
   latestPersisted: AppConfig,
@@ -113,6 +166,7 @@ export function resolveSettingsCloseConfig(
 
 export function App() {
   const { t } = useI18n();
+  const clientType = useMemo(() => detectClientType(), []);
   const [config, setConfig] = useState<AppConfig>(() => loadConfig());
   const configRef = useRef(config);
   configRef.current = config;
@@ -121,11 +175,23 @@ export function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsWelcome, setSettingsWelcome] = useState(false);
   const [settingsInitialSection, setSettingsInitialSection] = useState<SettingsSection>('execution');
+  const [integrationInitialTab, setIntegrationInitialTab] = useState<IntegrationTab>('mcp');
   const [daemonLive, setDaemonLive] = useState(false);
   const [agents, setAgents] = useState<AgentInfo[]>([]);
+  // Functional skills (capabilities the agent invokes mid-task) — stays
+  // small and lives under the Settings → Skills surface.
   const [skills, setSkills] = useState<SkillSummary[]>([]);
+  // Design templates (rendering catalogue: decks, prototypes, image/video/
+  // audio templates) — sourced from /api/design-templates and shown in the
+  // EntryView Templates tab. See specs/current/skills-and-design-templates.md.
+  const [designTemplates, setDesignTemplates] = useState<SkillSummary[]>([]);
   const [designSystems, setDesignSystems] = useState<DesignSystemSummary[]>([]);
   const [projects, setProjects] = useState<Project[]>([]);
+  const [petTaskCenter, setPetTaskCenter] = useState<PetTaskCenter>({
+    running: [],
+    queued: [],
+    recent: [],
+  });
   const [templates, setTemplates] = useState<ProjectTemplate[]>([]);
   const [promptTemplates, setPromptTemplates] = useState<
     PromptTemplateSummary[]
@@ -165,6 +231,43 @@ export function App() {
   // can't overwrite the saved state with `''` before hydration lands.
   const [composioConfigLoading, setComposioConfigLoading] = useState(true);
   const route = useRoute();
+  const analytics = useAnalytics();
+
+  // app_launch — fired exactly once per page load. Mounting in App, not the
+  // RootLayout, so we capture after the first React tick and the analytics
+  // provider has had a chance to wire its identity. Gated on
+  // `config.telemetry?.metrics` so a freshly-opted-in user gets the event
+  // on their next reload, and a declined user fires nothing.
+  const appLaunchFiredRef = useRef(false);
+  useEffect(() => {
+    if (appLaunchFiredRef.current) return;
+    if (config.telemetry?.metrics !== true) return;
+    appLaunchFiredRef.current = true;
+    trackAppLaunch(analytics.track, {
+      page: 'app',
+      launch_source: detectLaunchSource(),
+      platform: detectClientType(),
+    });
+  }, [analytics.track, config.telemetry?.metrics]);
+
+  // Propagate the Privacy toggle through to PostHog without a reload —
+  // posthog-js's opt_out_capturing flips a localStorage flag that makes
+  // every subsequent capture() a no-op. When the user opts back in we
+  // call opt_in_capturing to resume.
+  useEffect(() => {
+    analytics.setConsent(config.telemetry?.metrics === true);
+  }, [analytics.setConsent, config.telemetry?.metrics]);
+
+  // Sync PostHog's distinct_id with the anonymous installationId, both on
+  // first opt-in (when the daemon stamps a fresh id) and on Delete-my-data
+  // rotation (when PrivacySection.tsx generates a new one). posthog-js
+  // caches the previous id in localStorage; identify() alone would stitch
+  // the two ids together, so applyIdentity() does reset() first to
+  // guarantee the new session is fully decoupled from the deleted one.
+  useEffect(() => {
+    if (config.telemetry?.metrics !== true) return;
+    analytics.setIdentity(config.installationId ?? null);
+  }, [analytics.setIdentity, config.installationId, config.telemetry?.metrics]);
 
   // Sync theme preference to the <html> element so CSS variables pick it up.
   // useLayoutEffect (vs useEffect) fires before the browser paints, so a
@@ -232,10 +335,27 @@ export function App() {
         setAgentsLoading(false);
       });
 
+      // Functional skills + design templates land independently. Both
+      // gate `skillsLoading` together so the EntryView stops rendering
+      // its loader once both registries respond — neither tab would have
+      // a complete picture if we cleared the flag on the first reply.
+      let functionalReady = false;
+      let templatesReady = false;
+      const maybeClearLoading = () => {
+        if (functionalReady && templatesReady) setSkillsLoading(false);
+      };
       void fetchSkills().then((list) => {
         if (cancelled) return;
         setSkills(list);
-        setSkillsLoading(false);
+        functionalReady = true;
+        maybeClearLoading();
+      });
+
+      void fetchDesignTemplates().then((list) => {
+        if (cancelled) return;
+        setDesignTemplates(list);
+        templatesReady = true;
+        maybeClearLoading();
       });
 
       void fetchDesignSystems().then((list) => {
@@ -414,10 +534,21 @@ export function App() {
     setProjects(list);
   }, []);
 
+  const refreshDesignSystems = useCallback(async () => {
+    const list = await fetchDesignSystems();
+    setDesignSystems(list);
+  }, []);
+
   const refreshTemplates = useCallback(async () => {
     const list = await listTemplates();
     setTemplates(list);
   }, []);
+
+  const handleDeleteTemplate = useCallback(async (id: string) => {
+    const ok = await deleteTemplate(id);
+    if (ok) await refreshTemplates();
+    return ok;
+  }, [refreshTemplates]);
 
   const reloadMediaProvidersFromDaemon = useCallback(async () => {
     const result = await fetchMediaProvidersFromDaemon();
@@ -505,6 +636,22 @@ export function App() {
     [config],
   );
 
+  // Quick theme switch from the settings dropdown in the entry view.
+  // Skips the full SettingsDialog round-trip so the appearance flip
+  // feels instantaneous; the live preview comes for free because the
+  // `useLayoutEffect` above re-runs `applyAppearanceToDocument` the
+  // moment `config.theme` changes. We still persist to localStorage
+  // and the daemon so the choice survives reloads.
+  const handleThemeChange = useCallback(
+    (theme: AppConfig['theme']) => {
+      const next = { ...config, theme };
+      saveConfig(next);
+      void syncConfigToDaemon(next);
+      setConfig(next);
+    },
+    [config],
+  );
+
   const handleAgentChange = useCallback(
     (agentId: string) => {
       const next = { ...config, agentId };
@@ -524,6 +671,33 @@ export function App() {
         [agentId]: merged,
       };
       const next = { ...config, agentModels: nextAgentModels };
+      saveConfig(next);
+      void syncConfigToDaemon(next);
+      setConfig(next);
+    },
+    [config],
+  );
+
+  // BYOK protocol switch — also flips `mode` to 'api' so the user does
+  // not have to take a second step after picking a provider from the
+  // inline switcher. The helper preserves any per-protocol fields the
+  // user had previously configured for the target protocol.
+  const handleApiProtocolChange = useCallback(
+    (protocol: ApiProtocol) => {
+      const next = switchApiProtocolConfig(config, protocol);
+      saveConfig(next);
+      void syncConfigToDaemon(next);
+      setConfig(next);
+    },
+    [config],
+  );
+
+  // BYOK model picker — patches `model` (and the per-protocol shadow
+  // copy) without touching apiKey/baseUrl so the user can swap models
+  // mid-session without retyping their key.
+  const handleApiModelChange = useCallback(
+    (model: string) => {
+      const next = updateCurrentApiProtocolConfig(config, { model });
       saveConfig(next);
       void syncConfigToDaemon(next);
       setConfig(next);
@@ -557,7 +731,17 @@ export function App() {
   );
 
   const handleCreateProject = useCallback(
-    async (input: CreateInput & { pendingPrompt?: string }) => {
+    async (
+      input: CreateInput & {
+        pendingPrompt?: string;
+        pluginId?: string;
+        appliedPluginSnapshotId?: string;
+        pluginInputs?: Record<string, unknown>;
+        autoSendFirstMessage?: boolean;
+        requestId?: string;
+        pendingFiles?: File[];
+      },
+    ) => {
       // Honor an explicit `null` design system — the create panel defaults
       // to "None" for every kind now, and the user expects that to land
       // as a no-design-system project rather than silently inheriting the
@@ -566,23 +750,146 @@ export function App() {
       input.pendingPrompt ??
       (input.metadata?.promptTemplate?.prompt?.trim() || undefined);
 
+      const kind = input.metadata?.kind ?? null;
+      const fidelity = fidelityToTracking(input.metadata?.fidelity ?? null);
+      const creationSource: 'blank' | 'template' | 'zip' | 'folder' =
+        kind === 'template' ? 'template' : 'blank';
       const result = await createProject({
         name: input.name,
         skillId: input.skillId,
         designSystemId: input.designSystemId,
         pendingPrompt: derivedPendingPrompt,
         metadata: input.metadata,
+        ...(input.pluginId ? { pluginId: input.pluginId } : {}),
+        ...(input.appliedPluginSnapshotId
+          ? { appliedPluginSnapshotId: input.appliedPluginSnapshotId }
+          : {}),
+        ...(input.pluginInputs ? { pluginInputs: input.pluginInputs } : {}),
       });
-      if (!result) return;
+      if (!result) {
+        trackProjectCreateResult(
+          analytics.track,
+          {
+            page: 'home',
+            area: 'create_panel',
+            action_source: 'create_button',
+            project_id: null,
+            project_kind: projectKindToTracking(kind),
+            creation_source: creationSource,
+            fidelity,
+            result: 'failed',
+            error_code: 'CREATE_REQUEST_FAILED',
+          },
+          { requestId: input.requestId },
+        );
+        return;
+      }
+      const pendingFiles = Array.isArray(input.pendingFiles)
+        ? input.pendingFiles.filter((file): file is File => file instanceof File)
+        : [];
+      let firstMessageAttachments: ChatAttachment[] = [];
+      if (pendingFiles.length > 0) {
+        const uploadResult = await uploadProjectFiles(result.project.id, pendingFiles);
+        firstMessageAttachments = uploadResult.uploaded;
+        if (uploadResult.failed.length > 0) {
+          console.warn('Some Home attachments failed to upload', uploadResult.failed);
+        }
+      }
+      trackProjectCreateResult(
+        analytics.track,
+        {
+          page: 'home',
+          area: 'create_panel',
+          action_source: 'create_button',
+          project_id: result.project.id,
+          project_kind: projectKindToTracking(kind),
+          creation_source: creationSource,
+          fidelity,
+          result: 'success',
+        },
+        { requestId: input.requestId },
+      );
+      // PluginLoopHome flow: the user already typed (or accepted) the
+      // first message on Home. Mark this project so ProjectView fires
+      // sendMessage(pendingPrompt) once on mount instead of just
+      // pre-filling the composer. Scoped to sessionStorage so a page
+      // reload after the run has started does not refire.
+      if (
+        input.autoSendFirstMessage &&
+        (derivedPendingPrompt !== undefined || firstMessageAttachments.length > 0)
+      ) {
+        try {
+          window.sessionStorage.setItem(
+            `od:auto-send-first:${result.project.id}`,
+            '1',
+          );
+          if (firstMessageAttachments.length > 0) {
+            window.sessionStorage.setItem(
+              `od:auto-send-attachments:${result.project.id}`,
+              JSON.stringify(firstMessageAttachments),
+            );
+          } else {
+            window.sessionStorage.removeItem(
+              `od:auto-send-attachments:${result.project.id}`,
+            );
+          }
+        } catch {
+          /* sessionStorage may be unavailable (e.g. SSR / private mode); fall
+             back to manual send. */
+        }
+      }
+      const project = result.appliedPluginSnapshotId
+        ? {
+            ...result.project,
+            appliedPluginSnapshotId: result.appliedPluginSnapshotId,
+          }
+        : result.project;
       setProjects((curr) => [
-        result.project,
-        ...curr.filter((p) => p.id !== result.project.id),
+        project,
+        ...curr.filter((p) => p.id !== project.id),
       ]);
       navigate({
         kind: 'project',
-        projectId: result.project.id,
+        projectId: project.id,
         fileName: null,
       });
+    },
+    [analytics.track],
+  );
+
+  const handleCreatePluginShareProject = useCallback(
+    async (
+      pluginId: string,
+      action: PluginShareAction,
+      locale?: string,
+    ): Promise<PluginShareProjectOutcome> => {
+      const outcome = await createPluginShareProject(pluginId, action, locale);
+      if (!outcome.ok) return outcome;
+      try {
+        window.sessionStorage.setItem(
+          `od:auto-send-first:${outcome.project.id}`,
+          '1',
+        );
+      } catch {
+        // If sessionStorage is unavailable, the project still opens with
+        // the prepared prompt in the composer.
+      }
+      const project = outcome.appliedPluginSnapshotId
+        ? {
+            ...outcome.project,
+            appliedPluginSnapshotId: outcome.appliedPluginSnapshotId,
+          }
+        : outcome.project;
+      setProjects((curr) => [
+        project,
+        ...curr.filter((p) => p.id !== project.id),
+      ]);
+      navigate({
+        kind: 'project',
+        projectId: project.id,
+        fileName: null,
+      });
+      return outcome;
     },
     [],
   );
@@ -603,7 +910,6 @@ export function App() {
 
   const handleImportFolder = useCallback(async (baseDir: string) => {
     const result = await importFolderProject({ baseDir });
-    if (!result) return;
     setProjects((curr) => [result.project, ...curr.filter((p) => p.id !== result.project.id)]);
     navigate({
       kind: 'project',
@@ -612,9 +918,54 @@ export function App() {
     });
   }, []);
 
+  // PR #974: on desktop, the host bridge owns the picker and import POST
+  // atomically. The renderer never sees the path, token, or daemon DTO;
+  // it receives host-owned project identifiers and refreshes project state
+  // through the normal daemon API.
+  const handleImportFolderResponse = useCallback(async (result: OpenDesignHostProjectImportSuccess) => {
+    const project = await getProject(result.projectId);
+    if (project != null) {
+      setProjects((curr) => [project, ...curr.filter((p) => p.id !== project.id)]);
+    } else {
+      const list = await listProjects();
+      setProjects(list);
+    }
+    navigate({
+      kind: 'project',
+      projectId: result.projectId,
+      fileName: result.entryFile,
+    });
+  }, []);
+
   const handleOpenProject = useCallback((id: string) => {
     navigate({ kind: 'project', projectId: id, fileName: null });
   }, []);
+
+  useEffect(() => {
+    if (!config.pet?.enabled || !daemonLive) {
+      setPetTaskCenter({ running: [], queued: [], recent: [] });
+      return;
+    }
+
+    let cancelled = false;
+    const refresh = async () => {
+      const runs = await listProjectRuns();
+      if (cancelled) return;
+      setPetTaskCenter(buildPetTaskCenter(projects, runs));
+    };
+    const handleRunsChanged = () => {
+      void refresh();
+    };
+
+    void refresh();
+    window.addEventListener(RUNS_CHANGED_EVENT, handleRunsChanged);
+    const id = window.setInterval(refresh, 2000);
+    return () => {
+      cancelled = true;
+      window.removeEventListener(RUNS_CHANGED_EVENT, handleRunsChanged);
+      window.clearInterval(id);
+    };
+  }, [config.pet?.enabled, daemonLive, projects]);
 
   const handleOpenLiveArtifact = useCallback((projectId: string, artifactId: string) => {
     navigate({ kind: 'project', projectId, fileName: liveArtifactTabId(artifactId) });
@@ -625,12 +976,21 @@ export function App() {
     if (!ok) return;
     setProjects((curr) => curr.filter((p) => p.id !== id));
     if (route.kind === 'project' && route.projectId === id) {
-      navigate({ kind: 'home' });
+      navigate({ kind: 'home', view: 'home' });
     }
   }, [route]);
 
+  const handleRenameProject = useCallback(async (id: string, name: string) => {
+    const trimmed = name.trim();
+    if (!trimmed) return;
+    setProjects((curr) =>
+      curr.map((p) => (p.id === id ? { ...p, name: trimmed } : p)),
+    );
+    void patchProject(id, { name: trimmed });
+  }, []);
+
   const handleBack = useCallback(() => {
-    navigate({ kind: 'home' });
+    navigate({ kind: 'home', view: 'home' });
   }, []);
 
   const handleClearPendingPrompt = useCallback(() => {
@@ -641,7 +1001,7 @@ export function App() {
         p.id === projectId ? { ...p, pendingPrompt: undefined } : p,
       ),
     );
-    void patchProject(projectId, { pendingPrompt: undefined });
+    void patchProject(projectId, { pendingPrompt: null });
   }, [route]);
 
   const handleTouchProject = useCallback(() => {
@@ -677,7 +1037,7 @@ export function App() {
       if (cancelled) return;
       setProjects(list);
       if (!list.find((p) => p.id === route.projectId)) {
-        navigate({ kind: 'home' }, { replace: true });
+        navigate({ kind: 'home', view: 'home' }, { replace: true });
       }
     })();
     return () => {
@@ -686,6 +1046,17 @@ export function App() {
   }, [route, activeProject, projects, daemonLive]);
 
   const openSettings = useCallback((section: SettingsSection = 'execution') => {
+    if (section === 'composio' || section === 'mcpClient' || section === 'integrations') {
+      setIntegrationInitialTab(
+        section === 'composio'
+          ? 'connectors'
+          : section === 'mcpClient'
+            ? 'mcp'
+            : 'use-everywhere',
+      );
+      navigate({ kind: 'home', view: 'integrations' });
+      return;
+    }
     setSettingsWelcome(false);
     setSettingsInitialSection(section);
     setSettingsOpen(true);
@@ -698,10 +1069,25 @@ export function App() {
   }, []);
 
   const openMcpSettings = useCallback(() => {
-    setSettingsWelcome(false);
-    setSettingsInitialSection('mcpClient');
-    setSettingsOpen(true);
+    setIntegrationInitialTab('mcp');
+    navigate({ kind: 'home', view: 'integrations' });
   }, []);
+
+  // Cmd+, (mac) / Ctrl+, (win/linux) opens Settings. Capture phase so we
+  // beat the browser's default Preferences dialog. Platform-gated so
+  // meta/ctrl don't conflict across OS.
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      const primary = isMacPlatform() ? e.metaKey && !e.ctrlKey : e.ctrlKey && !e.metaKey;
+      if (primary && !e.shiftKey && !e.altKey && e.key === ',') {
+        if (e.isComposing) return;
+        e.preventDefault();
+        openSettings();
+      }
+    };
+    window.addEventListener('keydown', onKeyDown, { capture: true });
+    return () => window.removeEventListener('keydown', onKeyDown, { capture: true });
+  }, [openSettings]);
 
   // Explicit enabled toggle — true = wake, false = tuck. Persists to
   // localStorage so the overlay state survives across reloads. We keep
@@ -758,9 +1144,42 @@ export function App() {
     void refreshTemplates();
   }, [route.kind, refreshTemplates]);
 
+  // Existing card grids (DesignsTab, ProjectView), pickers (NewProjectPanel,
+  // ChatComposer mention) all look skills up by id without caring whether
+  // the id resolves to a functional skill or a design template. Pass them
+  // the union so the post-split refactor stays invisible to those callers.
+  const allSkillSummaries = useMemo(
+    () => [...skills, ...designTemplates],
+    [skills, designTemplates],
+  );
   const enabledSkills = useMemo(
-    () => skills.filter((s) => !(config.disabledSkills ?? []).includes(s.id)),
+    () =>
+      allSkillSummaries.filter(
+        (s) => !(config.disabledSkills ?? []).includes(s.id),
+      ),
+    [allSkillSummaries, config.disabledSkills],
+  );
+  // Functional-skills-only enabled subset — what ProjectView's chat
+  // composer @-picker should see. Without this, a skill the user has
+  // disabled in Settings still appears in an existing project's @-mention
+  // popover and can ride along to the daemon via skillIds, breaking the
+  // Library toggle for projects opened on the post-split branch.
+  const enabledFunctionalSkills = useMemo(
+    () =>
+      skills.filter(
+        (s) => !(config.disabledSkills ?? []).includes(s.id),
+      ),
     [skills, config.disabledSkills],
+  );
+  // Templates-only enabled subset — what the EntryView Templates gallery
+  // actually renders. Filtering in App keeps the EntryView prop surface
+  // narrow ("here are the templates the user has not disabled").
+  const enabledDesignTemplates = useMemo(
+    () =>
+      designTemplates.filter(
+        (s) => !(config.disabledSkills ?? []).includes(s.id),
+      ),
+    [designTemplates, config.disabledSkills],
   );
   const enabledDS = useMemo(
     () =>
@@ -770,65 +1189,145 @@ export function App() {
     [designSystems, config.disabledDesignSystems],
   );
 
+  // Phase 2B / spec §11.6 — marketplace deep UI dispatch. The
+  // /marketplace and /marketplace/:id routes render outside the
+  // EntryView / ProjectView split so the discovery surface stays
+  // independent of any active project.
+  let appMain: ReactNode;
+  if (route.kind === 'marketplace') {
+    appMain = <MarketplaceView />;
+  } else if (route.kind === 'marketplace-detail') {
+    appMain = <PluginDetailView pluginId={route.pluginId} />;
+  } else if (route.kind === 'design-system-create') {
+    appMain = (
+      <DesignSystemCreationFlow
+        onBack={() => navigate({ kind: 'home', view: 'design-systems' })}
+        onCreated={(projectId, project) => {
+          if (project) {
+            setProjects((curr) => [
+              project,
+              ...curr.filter((p) => p.id !== project.id),
+            ]);
+          }
+          navigate({ kind: 'project', projectId, conversationId: null, fileName: null });
+        }}
+        onProjectPrepared={(project) => {
+          setProjects((curr) => [
+            project,
+            ...curr.filter((p) => p.id !== project.id),
+          ]);
+        }}
+        onSystemsRefresh={refreshDesignSystems}
+        config={config}
+        onOpenConnectorsTab={() => openSettings('composio')}
+      />
+    );
+  } else if (route.kind === 'design-system-detail') {
+    appMain = (
+      <DesignSystemDetailView
+        id={route.designSystemId}
+        selectedId={config.designSystemId}
+        config={config}
+        agents={agents}
+        onBack={() => navigate({ kind: 'home', view: 'design-systems' })}
+        onOpenProject={(projectId) => navigate({ kind: 'project', projectId, conversationId: null, fileName: null })}
+        onSetDefault={handleChangeDefaultDesignSystem}
+        onSystemsRefresh={refreshDesignSystems}
+        onProjectsRefresh={refreshProjects}
+      />
+    );
+  } else if (activeProject) {
+    appMain = (
+      <ProjectView
+        key={activeProject.id}
+        project={activeProject}
+        routeFileName={route.kind === 'project' ? route.fileName : null}
+        routeConversationId={route.kind === 'project' ? route.conversationId : null}
+        config={config}
+        agents={agents}
+        skills={enabledFunctionalSkills}
+        designTemplates={designTemplates}
+        designSystems={designSystems}
+        daemonLive={daemonLive}
+        onModeChange={handleModeChange}
+        onAgentChange={handleAgentChange}
+        onAgentModelChange={handleAgentModelChange}
+        onRefreshAgents={refreshAgents}
+        onOpenSettings={openSettings}
+        onOpenMcpSettings={openMcpSettings}
+        onAdoptPetInline={handleAdoptPet}
+        onTogglePet={handleTogglePet}
+        onOpenPetSettings={openPetSettings}
+        onBack={handleBack}
+        onClearPendingPrompt={handleClearPendingPrompt}
+        onTouchProject={handleTouchProject}
+        onProjectChange={handleProjectChange}
+        onProjectsRefresh={refreshProjects}
+      />
+    );
+  } else {
+    appMain = (
+      <EntryView
+        skills={enabledSkills}
+        designTemplates={enabledDesignTemplates}
+        designSystems={enabledDS}
+        projects={projects}
+        templates={templates}
+        onDeleteTemplate={handleDeleteTemplate}
+        promptTemplates={promptTemplates}
+        defaultDesignSystemId={config.designSystemId}
+        agents={agents}
+        config={config}
+        integrationInitialTab={integrationInitialTab}
+        composioConfigLoading={composioConfigLoading}
+        daemonLive={daemonLive}
+        onModeChange={handleModeChange}
+        onAgentChange={handleAgentChange}
+        onAgentModelChange={handleAgentModelChange}
+        onApiProtocolChange={handleApiProtocolChange}
+        onApiModelChange={handleApiModelChange}
+        onThemeChange={handleThemeChange}
+        skillsLoading={skillsLoading}
+        designSystemsLoading={dsLoading}
+        projectsLoading={projectsLoading}
+        promptTemplatesLoading={promptTemplatesLoading}
+        onCreateProject={handleCreateProject}
+        onCreatePluginShareProject={handleCreatePluginShareProject}
+        onImportClaudeDesign={handleImportClaudeDesign}
+        onImportFolder={handleImportFolder}
+        onImportFolderResponse={handleImportFolderResponse}
+        onOpenProject={handleOpenProject}
+        onOpenLiveArtifact={handleOpenLiveArtifact}
+        onDeleteProject={handleDeleteProject}
+        onRenameProject={handleRenameProject}
+        onChangeDefaultDesignSystem={handleChangeDefaultDesignSystem}
+        onCreateDesignSystem={() => navigate({ kind: 'design-system-create' })}
+        onOpenDesignSystem={(id: string) => navigate({ kind: 'design-system-detail', designSystemId: id })}
+        onDesignSystemsRefresh={refreshDesignSystems}
+        onPersistComposioKey={handleConfigPersistComposioKey}
+        onOpenSettings={openSettings}
+      />
+    );
+  }
   return (
     <>
-      {activeProject ? (
-        <ProjectView
-          key={activeProject.id}
-          project={activeProject}
-          routeFileName={route.kind === 'project' ? route.fileName : null}
-          config={config}
-          agents={agents}
-          skills={skills}
-          designSystems={designSystems}
-          daemonLive={daemonLive}
-          onModeChange={handleModeChange}
-          onAgentChange={handleAgentChange}
-          onAgentModelChange={handleAgentModelChange}
-          onRefreshAgents={refreshAgents}
-          onOpenSettings={openSettings}
-          onOpenMcpSettings={openMcpSettings}
-          onAdoptPetInline={handleAdoptPet}
-          onTogglePet={handleTogglePet}
-          onOpenPetSettings={openPetSettings}
-          onBack={handleBack}
-          onClearPendingPrompt={handleClearPendingPrompt}
-          onTouchProject={handleTouchProject}
-          onProjectChange={handleProjectChange}
-          onProjectsRefresh={refreshProjects}
-        />
-      ) : (
-        <EntryView
-          skills={enabledSkills}
-          designSystems={enabledDS}
+      <div
+        className={`workspace-shell workspace-shell--${clientType}`}
+        data-client-type={clientType}
+      >
+        <WorkspaceTabsBar
+          route={route}
           projects={projects}
-          templates={templates}
-          promptTemplates={promptTemplates}
-          defaultDesignSystemId={config.designSystemId}
-          config={config}
-          agents={agents}
-          skillsLoading={skillsLoading}
-          designSystemsLoading={dsLoading}
-          projectsLoading={projectsLoading}
-          promptTemplatesLoading={promptTemplatesLoading}
-          onCreateProject={handleCreateProject}
-          onImportClaudeDesign={handleImportClaudeDesign}
-          onImportFolder={handleImportFolder}
+        />
+        <div className="workspace-shell__body">{appMain}</div>
+      </div>
+      {clientType === 'desktop' ? null : (
+        <PetOverlay
+          pet={config.pet?.enabled ? config.pet : undefined}
+          taskCenter={petTaskCenter}
           onOpenProject={handleOpenProject}
-          onOpenLiveArtifact={handleOpenLiveArtifact}
-          onDeleteProject={handleDeleteProject}
-          onChangeDefaultDesignSystem={handleChangeDefaultDesignSystem}
-          onOpenSettings={openSettings}
-          onAdoptPet={openPetSettings}
-          onAdoptPetInline={handleAdoptPet}
-          onTogglePet={handleTogglePet}
         />
       )}
-      <PetOverlay
-        pet={config.pet?.enabled ? config.pet : undefined}
-        onTuck={handleTuckPet}
-        onOpenSettings={openPetSettings}
-      />
       {settingsOpen ? (
         <SettingsDialog
           initial={config}
@@ -862,13 +1361,18 @@ export function App() {
           onReloadMediaProviders={reloadMediaProvidersFromDaemon}
         />
       ) : null}
+      <MemoryToast onOpenMemory={() => openSettings('memory')} />
       {/* First-run privacy consent banner. It waits for daemon config
           hydration because privacyDecisionAt is daemon-owned and stripped
           from localStorage. It also yields while Settings is open so the
           floating banner never intercepts modal interactions. */}
       {showPrivacyConsent ? (
         <PrivacyConsentModal
-          onShare={() => {
+          onAccept={() => {
+            // Default opt-in: clicking "I get it" enables the same telemetry
+            // surface the previous two-button "Share usage data" path opted
+            // into. The banner footer + PrivacySection give the user a
+            // one-click path to flip everything off later.
             const installationId = generateInstallationIdSafe();
             void handleConfigPersist({
               ...latestPersistedConfigRef.current,
@@ -879,18 +1383,6 @@ export function App() {
             // Hand the foreground over to the welcome modal now that the
             // privacy decision is recorded — bootstrap deferred opening
             // it while consent was pending.
-            if (!latestPersistedConfigRef.current.onboardingCompleted) {
-              setSettingsWelcome(true);
-              setSettingsOpen(true);
-            }
-          }}
-          onDecline={() => {
-            void handleConfigPersist({
-              ...latestPersistedConfigRef.current,
-              installationId: null,
-              privacyDecisionAt: Date.now(),
-              telemetry: { metrics: false, content: false, artifactManifest: false },
-            });
             if (!latestPersistedConfigRef.current.onboardingCompleted) {
               setSettingsWelcome(true);
               setSettingsOpen(true);

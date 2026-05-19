@@ -510,6 +510,65 @@ describe('finalizeDesignPackage (pipeline integration)', () => {
     expect(dirEntries).not.toContain('.finalize.lock');
   });
 
+  it('uses Google Gemini generateContent when finalize protocol is google', async () => {
+    const { db, projectsRoot, designSystemsRoot } = setupPipeline({
+      designSystemId: 'shadcn',
+      designSystemBody: '# shadcn\n',
+    });
+    const fetchImpl = vi.fn(async (_url: string, _init: RequestInit) =>
+      new Response(
+        JSON.stringify({
+          candidates: [
+            {
+              content: {
+                parts: [
+                  { text: '# DESIGN.md\n' },
+                  { text: '## Summary\nGemini synthesis.\n' },
+                ],
+              },
+            },
+          ],
+          usageMetadata: {
+            promptTokenCount: 4321,
+            candidatesTokenCount: 876,
+          },
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      ),
+    );
+
+    const result = await finalizeDesignPackage(db, projectsRoot, designSystemsRoot, PROJECT_ID, {
+      protocol: 'google',
+      apiKey: 'AIza-test-key',
+      baseUrl: 'https://generativelanguage.googleapis.com',
+      model: 'gemini-2.0-flash',
+      fetchImpl: fetchImpl as any,
+    } as any);
+
+    expect(result.model).toBe('gemini-2.0-flash');
+    expect(result.inputTokens).toBe(4321);
+    expect(result.outputTokens).toBe(876);
+    expect(fs.readFileSync(result.designMdPath, 'utf8')).toBe(
+      '# DESIGN.md\n## Summary\nGemini synthesis.\n',
+    );
+
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchImpl.mock.calls[0]!;
+    expect(url).toBe(
+      'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent',
+    );
+    expect((init as RequestInit).headers).toMatchObject({
+      'content-type': 'application/json',
+      'x-goog-api-key': 'AIza-test-key',
+    });
+    const body = JSON.parse((init as RequestInit).body as string);
+    expect(body.systemInstruction.parts[0].text).toContain('# DESIGN.md');
+    expect(body.contents).toHaveLength(1);
+    expect(body.contents[0].role).toBe('user');
+    expect(body.contents[0].parts[0].text).toContain('Synthesize DESIGN.md');
+    expect(body.generationConfig.maxOutputTokens).toBe(16000);
+  });
+
   it('response carries every documented field with correct types', async () => {
     const { db, projectsRoot, designSystemsRoot } = setupPipeline({
       designSystemId: 'shadcn',
@@ -773,6 +832,74 @@ describe('finalizeDesignPackage (pipeline integration)', () => {
       name: 'FinalizeUpstreamError',
       status: 502,
     });
+  });
+
+  // PR #974 round 7 (lefarcen P1): the helper used to disable its own
+  // timeout when the caller passed a request-abort signal. These two tests
+  // pin the AbortSignal.any combination so neither cancel path replaces the
+  // other. The `timeoutMs` option exists solely so these tests can exercise
+  // the abort path without a 120 s real-time wait or fake-timer chains.
+  it('aborts after the helper timeout fires even when caller signal never aborts', async () => {
+    const { db, projectsRoot, designSystemsRoot } = setupPipeline({
+      designSystemId: 'shadcn',
+      designSystemBody: '# shadcn\n',
+    });
+
+    let capturedSignal: AbortSignal | undefined;
+    const hangingFetch = vi.fn((_url: string, init?: RequestInit) => {
+      capturedSignal = init?.signal ?? undefined;
+      return new Promise<Response>((_resolve, reject) => {
+        capturedSignal?.addEventListener('abort', () => {
+          const err = new Error('aborted');
+          err.name = 'AbortError';
+          reject(err);
+        });
+      });
+    }) as unknown as typeof globalThis.fetch;
+
+    const callerController = new AbortController();
+    await expect(
+      finalizeDesignPackage(db, projectsRoot, designSystemsRoot, PROJECT_ID, {
+        apiKey: 'sk-test',
+        baseUrl: 'https://api.anthropic.com',
+        model: 'claude-opus-4-7',
+        fetchImpl: hangingFetch as any,
+        signal: callerController.signal,
+        timeoutMs: 50,
+      } as any),
+    ).rejects.toMatchObject({ name: 'AbortError' });
+
+    expect(callerController.signal.aborted).toBe(false);
+    expect(capturedSignal?.aborted).toBe(true);
+  });
+
+  it('aborts immediately when caller signal aborts before fetch settles', async () => {
+    const { db, projectsRoot, designSystemsRoot } = setupPipeline({
+      designSystemId: 'shadcn',
+      designSystemBody: '# shadcn\n',
+    });
+
+    const callerController = new AbortController();
+    callerController.abort();
+
+    const fetchImpl = vi.fn(async (_url: string, init?: RequestInit) => {
+      if (init?.signal?.aborted) {
+        const err = new Error('aborted');
+        err.name = 'AbortError';
+        throw err;
+      }
+      throw new Error('fetch should not see a non-aborted signal when caller aborted pre-flight');
+    }) as unknown as typeof globalThis.fetch;
+
+    await expect(
+      finalizeDesignPackage(db, projectsRoot, designSystemsRoot, PROJECT_ID, {
+        apiKey: 'sk-test',
+        baseUrl: 'https://api.anthropic.com',
+        model: 'claude-opus-4-7',
+        fetchImpl: fetchImpl as any,
+        signal: callerController.signal,
+      } as any),
+    ).rejects.toMatchObject({ name: 'AbortError' });
   });
 });
 

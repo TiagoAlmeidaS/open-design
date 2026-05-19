@@ -17,7 +17,8 @@ import {
 } from "../mac-prebundle.js";
 import { copyBundledResourceTrees } from "../resources.js";
 import { runEsbuild, runNpmInstall, runPnpm } from "./commands.js";
-import { INTERNAL_PACKAGES, PRODUCT_NAME } from "./constants.js";
+import { INTERNAL_PACKAGES } from "./constants.js";
+import { resolveMacInstallIdentity } from "./identity.js";
 import { readPackagedVersion } from "./manifest.js";
 import type { MacPaths, PackedTarballInfo } from "./types.js";
 
@@ -176,8 +177,13 @@ export async function writeAssembledApp(
   packedTarballs: PackedTarballInfo[],
 ): Promise<void> {
   const packagedVersion = await readPackagedVersion(config);
+  const identity = resolveMacInstallIdentity(config);
   await rm(join(config.roots.output.namespaceRoot, "assembled"), { force: true, recursive: true });
   await mkdir(paths.assembledAppRoot, { recursive: true });
+  await cp(
+    join(config.workspaceRoot, "apps", "desktop", "dist", "main", "preload.cjs"),
+    join(paths.assembledAppRoot, "preload.cjs"),
+  );
   const tarballByPackage = Object.fromEntries(
     packedTarballs.map((entry) => [entry.packageName, entry.fileName] as const),
   );
@@ -208,7 +214,7 @@ export async function writeAssembledApp(
         main: "./main.cjs",
         name: "open-design-packaged-app",
         private: true,
-        productName: PRODUCT_NAME,
+        productName: identity.productName,
         version: packagedVersion,
       },
       null,
@@ -233,6 +239,9 @@ export async function writeAssembledApp(
         ...(usePrebundledStandaloneWeb ? { daemonSidecarEntryRelative: MAC_PREBUNDLED_DAEMON_SIDECAR_RELATIVE_PATH } : {}),
         namespace: config.namespace,
         nodeCommandRelative: "open-design/bin/node",
+        ...(config.telemetryRelayUrl == null ? {} : { telemetryRelayUrl: config.telemetryRelayUrl }),
+        ...(config.posthogKey == null ? {} : { posthogKey: config.posthogKey }),
+        ...(config.posthogHost == null ? {} : { posthogHost: config.posthogHost }),
         ...(usePrebundledStandaloneWeb ? { webSidecarEntryRelative: MAC_PREBUNDLED_WEB_SIDECAR_RELATIVE_PATH } : {}),
         webOutputMode: config.webOutputMode,
         ...(config.portable ? {} : { namespaceBaseRoot: config.roots.runtime.namespaceBaseRoot }),
